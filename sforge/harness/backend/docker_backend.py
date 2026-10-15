@@ -20,13 +20,11 @@ import io
 import logging
 import os
 import signal
-import sys
 import tarfile
 import threading
-import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
-from typing import Callable
 
 import docker
 import docker.errors
@@ -93,6 +91,7 @@ class DockerBackend(ContainerBackend):
 
     def __init__(self, client: docker.DockerClient | None = None) -> None:
         self._client = client or docker.from_env()
+        self._judge_capacity_owner_id: str | None = None
 
     @property
     def backend_name(self) -> str:
@@ -213,6 +212,43 @@ class DockerBackend(ContainerBackend):
         except docker.errors.NotFound:
             pass
 
+    def judge_capacity_owner_id(self) -> str | None:
+        if self._judge_capacity_owner_id is None:
+            engine_id = self._client.info().get("ID")
+            if not engine_id:
+                return None
+            self._judge_capacity_owner_id = f"docker:{engine_id}"
+        return self._judge_capacity_owner_id
+
+    def reconcile_judge_capacity_holder(
+        self, token: str, owner_id: str | None,
+    ) -> bool:
+        current_owner_id = self.judge_capacity_owner_id()
+        if owner_id is not None and owner_id != current_owner_id:
+            return False
+        _, separator, submission_id = token.partition(":")
+        if not separator or not submission_id:
+            return False
+        suffix = f".{submission_id}"
+        candidates = self._client.containers.list(
+            all=True, filters={"name": submission_id}
+        )
+        owned = [
+            container for container in candidates
+            if ".judge." in container.name and container.name.endswith(suffix)
+        ]
+        if owner_id is None and not owned:
+            return False
+        for container in owned:
+            container.remove(force=True)
+        remaining = self._client.containers.list(
+            all=True, filters={"name": submission_id}
+        )
+        return not any(
+            ".judge." in container.name and container.name.endswith(suffix)
+            for container in remaining
+        )
+
     # --- Image ---
 
     def image_exists(self, image_key: str) -> bool:
@@ -294,16 +330,20 @@ class DockerBackend(ContainerBackend):
         log_append: bool = False,
         on_chunk: Callable[[bytes], None] | None = None,
     ) -> StreamingExecResult:
+        native_codes: list[int] = []
         result = self._exec_run_impl(
             handle, cmd, timeout,
             log_file=log_file, user=user, workdir=workdir,
             environment=environment, stream_to_stdout=stream_to_stdout,
             shutdown_event=shutdown_event, log_append=log_append,
             on_chunk=on_chunk,
+            on_terminal=native_codes.append,
         )
         return StreamingExecResult(
             output=result[0], exit_code=result[1],
             timed_out=result[2], elapsed_seconds=result[3],
+            terminal_observed=bool(native_codes),
+            native_exit_code=native_codes[-1] if native_codes else None,
         )
 
     def exec_run_with_exit_code(
@@ -339,78 +379,18 @@ class DockerBackend(ContainerBackend):
         shutdown_event: threading.Event | None = None,
         log_append: bool = False,
         on_chunk: Callable[[bytes], None] | None = None,
+        on_terminal: Callable[[int], None] | None = None,
     ) -> tuple[str, int, bool, float]:
-        container = self._raw(handle)
-        chunks: list[bytes] = []
-        exec_id = None
-        exception = None
-        timed_out = False
-        log_fh = None
+        from sforge.harness.docker_utils import _exec_run
 
-        try:
-            if log_file:
-                log_file.parent.mkdir(parents=True, exist_ok=True)
-                log_fh = open(log_file, "ab" if log_append else "wb")
-
-            def run_command():
-                nonlocal exec_id, exception
-                try:
-                    kwargs = {}
-                    if user:
-                        kwargs["user"] = user
-                    if workdir:
-                        kwargs["workdir"] = workdir
-                    if environment:
-                        kwargs["environment"] = environment
-                    exec_id = container.client.api.exec_create(container.id, cmd, **kwargs)["Id"]
-                    exec_stream = container.client.api.exec_start(exec_id, stream=True)
-                    for chunk in exec_stream:
-                        chunks.append(chunk)
-                        if log_fh:
-                            log_fh.write(chunk)
-                            log_fh.flush()
-                        if stream_to_stdout:
-                            sys.stdout.buffer.write(chunk)
-                            sys.stdout.buffer.flush()
-                        if on_chunk is not None:
-                            try:
-                                on_chunk(chunk)
-                            except Exception:
-                                pass
-                except Exception as e:
-                    exception = e
-
-            thread = threading.Thread(target=run_command)
-            start_time = time.time()
-            thread.start()
-
-            deadline = start_time + timeout if timeout else None
-            while thread.is_alive():
-                remaining = (deadline - time.time()) if deadline else 1.0
-                if remaining <= 0:
-                    break
-                thread.join(min(remaining, 1.0))
-                if shutdown_event and shutdown_event.is_set():
-                    break
-        finally:
-            if log_fh:
-                log_fh.close()
-
-        if exception:
-            raise exception
-
-        if thread.is_alive():
-            if exec_id is not None:
-                exec_pid = container.client.api.exec_inspect(exec_id)["Pid"]
-                container.exec_run(["/bin/sh", "-c", f"kill -TERM {exec_pid}"], detach=True)
-            timed_out = True
-            exit_code = -1
-        else:
-            exit_code = container.client.api.exec_inspect(exec_id)["ExitCode"] if exec_id else -1
-
-        end_time = time.time()
-        output = b"".join(chunks).decode(errors="replace")
-        return output, exit_code, timed_out, end_time - start_time
+        return _exec_run(
+            self._raw(handle), cmd, timeout,
+            log_file=log_file, user=user, workdir=workdir,
+            environment=environment, stream_to_stdout=stream_to_stdout,
+            shutdown_event=shutdown_event, log_append=log_append,
+            on_chunk=on_chunk,
+            on_terminal=on_terminal,
+        )
 
     # --- Inspection ---
 

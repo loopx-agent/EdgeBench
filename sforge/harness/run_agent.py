@@ -28,8 +28,10 @@ Architecture:
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import shlex
 import signal
 import tarfile as _tarfile
@@ -56,6 +58,7 @@ from sforge.harness.evolve_scripts import (
     generate_game_prompt,
     generate_submit_script,
 )
+from sforge.harness.restored_registration import RestoredExecution, RestoredRegistration
 from sforge.harness.task_spec import TaskSpec
 
 
@@ -74,6 +77,9 @@ class RunResult:
     timed_out: bool = False
     runtime_seconds: float = 0.0
     resume_count: int = 0
+    grading_status: str = "unknown"
+    grading_reason: str = "not_finalized"
+    solver_execution: dict | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -86,6 +92,9 @@ class RunResult:
             "runtime_seconds": self.runtime_seconds,
             "archive_size_bytes": len(self.archive),
             "resume_count": self.resume_count,
+            "grading_status": self.grading_status,
+            "grading_reason": self.grading_reason,
+            "solver_execution": self.solver_execution,
         }
         if self.best_score is not None:
             d["best_score"] = self.best_score
@@ -265,14 +274,34 @@ def _auto_eval_loop(
 ) -> None:
     """Host-side auto-eval: periodically extract code and submit to judge.
 
-    Runs as a daemon thread. Fire-and-forget — does not poll for results.
+    Runs as a daemon thread. Production is **back-pressured**: the next snapshot is
+    only taken after the previous auto submission reached a terminal state, so a long-running judge cannot accumulate overlapping
+    auto work. It still never polls for *results* — it only observes terminality.
+    Submissions already accepted are always finished by the judge; stopping the
+    wait early hands them to the drain, they are never abandoned.
     Writes tick entries to auto_eval_ticks.log for post-mortem inspection.
     """
     ticks_log = log_dir / "auto_eval_ticks.log"
+    previous: str | None = None
     while True:
         stop_event.wait(eval_interval)
         if stop_event.is_set():
             break
+        # Back-pressure: wait for the previous auto submission to finish before
+        # producing the next snapshot. Bounded, and abandoned on stop so shutdown
+        # stays prompt; the drain then finishes whatever was already accepted.
+        if previous is not None:
+            previous = _await_previous_auto(
+                host_judge_url, session_token, previous, stop_event, logger,
+                ticks_log, eval_interval,
+            )
+            if stop_event.is_set():
+                break
+            if previous is not None:
+                # Still not terminal: do NOT take a new snapshot. Falling through
+                # here is what made the back-pressure cosmetic - the caller posted a
+                # fresh archive and overwrote `previous`, so nothing was ever bounded.
+                continue
         try:
             archive = _extract_archive_from_container(
                 backend, handle, task_spec, shutdown_event=stop_event,
@@ -291,6 +320,7 @@ def _auto_eval_loop(
             )
             resp.raise_for_status()
             data = resp.json()
+            previous = data.get("submission_id")
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             with open(ticks_log, "a") as f:
                 f.write(f"[{ts}] submitted {len(archive)} bytes -> {data.get('submission_id', '?')} round={data.get('round_id', '?')}\n")
@@ -302,6 +332,243 @@ def _auto_eval_loop(
             except Exception:
                 pass
             logger.debug("Auto-eval tick failed: %s", e)
+
+
+def _await_previous_auto(host_judge_url, session_token, submission_id, stop_event, logger,
+                         ticks_log, wait_budget) -> str | None:
+    """Wait until `submission_id` reaches a terminal state, or the budget runs out.
+
+    Returns the submission id when it is still not terminal (so the caller keeps
+    waiting on the same one) or None once it finished. Never abandons an accepted
+    submission: it only decides when the *next* snapshot may be taken.
+    """
+    deadline = time.time() + max(0.0, float(wait_budget))
+    while True:
+        if stop_event.is_set():
+            return None
+        try:
+            resp = requests.get(
+                f"{host_judge_url}/api/v1/result/{submission_id}",
+                params={"token": session_token}, timeout=30,
+            )
+            resp.raise_for_status()
+            status = (resp.json() or {}).get("status")
+        except Exception as e:  # noqa: BLE001 - a transient poll failure must not
+            status = None          # turn into an auto-submission storm
+            logger.debug("Auto-eval back-pressure poll failed: %s", e)
+        if status in ("completed", "error"):
+            return None
+        if time.time() >= deadline:
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            try:
+                with open(ticks_log, "a") as f:
+                    f.write(f"[{ts}] back-pressure: {submission_id} still {status}; deferring next snapshot\n")
+            except Exception:
+                pass
+            return submission_id
+        if stop_event.wait(5.0):
+            return None
+
+
+@dataclass
+class _GradingResult:
+    history: dict | None
+    status: str
+    reason: str
+    pending_submissions: int | None = None
+    elapsed_seconds: float = 0.0
+    wait_budget_seconds: float = 0.0
+
+
+def _read_grading_history(host_judge_url: str, session_token: str, admin_secret: str,
+                          *, timeout: float = 10) -> tuple[dict, int]:
+    response = requests.get(
+        f"{host_judge_url}/api/v1/history",
+        params={"token": session_token, "admin_secret": admin_secret},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    history = response.json()
+    if not isinstance(history, dict) or not isinstance(history.get("entries"), list):
+        raise TypeError("Invalid grading history")
+    # Validate the official summary before consuming it in success/error paths.
+    # This is shape validation only; score selection remains owned by the judge.
+    for key in ("best_score", "best_pass_rate"):
+        value = history.get(key)
+        if value is None and key == "best_score":
+            continue
+        if key not in history:
+            continue
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError("Invalid grading summary score")
+    for key in ("agent_submissions", "auto_submissions"):
+        value = history.get(key, 0)
+        if type(value) is not int or value < 0:
+            raise ValueError("Invalid grading summary count")
+    if not isinstance(history.get("best_round", ""), str):
+        raise TypeError("Invalid grading summary round")
+    pending = 0
+    for entry in history["entries"]:
+        if not isinstance(entry, dict):
+            raise TypeError("Invalid grading history entry")
+        if entry.get("type", "submission") not in ("submission", "game"):
+            raise ValueError("Unknown grading history entry type")
+        status = entry.get("status")
+        if status in ("running", "queued"):
+            pending += 1
+        elif status is None:
+            if not any(key in entry for key in ("score", "pass_rate", "max_score")):
+                raise ValueError("Unrecognized legacy grading entry")
+        elif status not in ("completed", "error"):
+            raise ValueError("Unknown grading history status")
+    return history, pending
+
+
+def _wait_for_grading(host_judge_url: str, session_token: str, admin_secret: str,
+                      *, eval_timeout: int, shutdown_event: threading.Event | None,
+                      logger, incomplete_reason: str | None = None,
+                      max_wait_seconds: float | None = None,
+                      history_reader=None) -> _GradingResult:
+    # eval_timeout covers execution only. Keep a bounded allowance for judge
+    # container setup, report persistence and cleanup, in addition to that budget.
+    if type(eval_timeout) not in (int, float) or not math.isfinite(eval_timeout) or eval_timeout < 0:
+        raise ValueError("eval_timeout must be finite and non-negative")
+    if max_wait_seconds is not None and (
+        type(max_wait_seconds) not in (int, float)
+        or not math.isfinite(max_wait_seconds) or max_wait_seconds <= 0
+    ):
+        raise ValueError("max_wait_seconds must be finite and positive")
+    per_evaluation_budget = max(900.0, float(eval_timeout) + 600.0)
+    budget = min(per_evaluation_budget, max_wait_seconds) if max_wait_seconds is not None else per_evaluation_budget
+    queue_budget_frozen = False
+    read_history = history_reader or _read_grading_history
+    started = time.monotonic()
+    deadline = started + budget
+    history = None
+    pending = None
+    last_read_ok = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            observed, count = read_history(
+                host_judge_url, session_token, admin_secret,
+                timeout=min(10.0, remaining),
+            )
+            history, pending = observed, count
+            last_read_ok = True
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            last_read_ok = False
+            # Request exceptions can contain token-bearing URLs.
+            logger.warning("Grading history unavailable (%s)", type(exc).__name__)
+        interrupted = shutdown_event is not None and shutdown_event.is_set()
+        if incomplete_reason or interrupted:
+            return _GradingResult(
+                history, "pending" if last_read_ok and pending else "unknown",
+                incomplete_reason or "interrupted", pending if last_read_ok else None,
+                time.monotonic() - started, budget,
+            )
+        # requests' timeout bounds socket inactivity, not total response time.
+        # A late response can preserve evidence but cannot qualify this drain.
+        if time.monotonic() > deadline:
+            break
+        if last_read_ok and not queue_budget_frozen:
+            # Producers must already be stopped. Allow serial completion of the
+            # queue observed once, keeping the original start time. Later polls
+            # never slide this deadline, even if the queue changes or stalls.
+            budget = per_evaluation_budget * max(1, pending)
+            if max_wait_seconds is not None:
+                budget = min(budget, max_wait_seconds)
+            deadline = started + budget
+            queue_budget_frozen = True
+        if last_read_ok and pending == 0:
+            return _GradingResult(history, "complete", "drained", 0,
+                                  time.monotonic() - started, budget)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        delay = min(15.0, remaining)
+        if shutdown_event is None:
+            time.sleep(delay)
+        else:
+            shutdown_event.wait(delay)
+    return _GradingResult(
+        history, "pending" if last_read_ok and pending else "unknown",
+        "deadline" if last_read_ok else "history_unavailable",
+        pending if last_read_ok else None, time.monotonic() - started, budget,
+    )
+
+
+def _write_grading(log_dir: Path, history_file: str, result: _GradingResult,
+                   run_id: str) -> dict:
+    # A failed read is explicit in the sidecar; retain the last successful
+    # snapshot rather than replacing a known partial score with an empty result.
+    history = result.history if result.history is not None else {
+        "run_id": run_id, "best_score": None, "best_pass_rate": 0.0,
+        "best_round": "", "agent_submissions": 0, "auto_submissions": 0,
+        "entries": [],
+    }
+    raw = json.dumps(history, indent=2, ensure_ascii=False).encode("utf-8")
+    path = log_dir / history_file
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_bytes(raw)
+    temp.replace(path)
+    status = {
+        "schema_version": 1,
+        "status": result.status,
+        "reason": result.reason,
+        "pending_submissions": result.pending_submissions,
+        "elapsed_seconds": result.elapsed_seconds,
+        "wait_budget_seconds": result.wait_budget_seconds,
+        "history_file": history_file,
+        "history_observed": result.history is not None,
+        "history_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    temp = log_dir / "grading_status.json.tmp"
+    temp.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    temp.replace(log_dir / "grading_status.json")
+    return history
+
+
+def _write_solver_execution(log_dir: Path, execution: dict) -> None:
+    """Persist the latest receipt, including an in-flight segment before dispatch."""
+    temp = log_dir / "solver_execution.json.tmp"
+    temp.write_text(json.dumps(execution, indent=2), encoding="utf-8")
+    temp.replace(log_dir / "solver_execution.json")
+
+
+def _solver_segment_result(result, stop_requested: bool) -> dict:
+    code = getattr(result, "exit_code", None)
+    native_code = getattr(result, "native_exit_code", None)
+    observed = getattr(result, "terminal_observed", None)
+    term_signal = getattr(result, "termination_signal", None)
+    code = code if type(code) is int else None
+    native_code = native_code if type(native_code) is int else None
+    observed = observed if type(observed) is bool else None
+    # A shell return value of 128+N can also be an explicit exit code. Preserve
+    # signal evidence only when the backend independently supplies it.
+    term_signal = (term_signal if observed is True and type(term_signal) is int
+                   and 0 < term_signal < signal.NSIG else None)
+    if result.timed_out:
+        status = "cancelled" if stop_requested else "timed_out"
+    elif observed is True and term_signal is not None:
+        status = "signaled"
+    elif observed is True and native_code is not None and native_code >= 0:
+        status = "normal_exit" if native_code == 0 else "nonzero_exit"
+    else:
+        status = "unknown"
+    return {
+        "status": status, "returned_exit_code": code,
+        "native_exit_code": native_code, "terminal_observed": observed,
+        "termination_signal": term_signal, "timed_out": result.timed_out,
+        "stop_requested": stop_requested, "elapsed_seconds": result.elapsed_seconds,
+        "finished_at": time.time(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +594,7 @@ def run_agent(
     shutdown_event: threading.Event | None = None,
     max_submissions: int | None = None,
     submission_cooldown: int | None = None,
+    restored_registration: RestoredRegistration | None = None,
 ) -> RunResult:
     """Run an agent on a task with iterative evaluation.
 
@@ -337,16 +605,46 @@ def run_agent(
     3. Install agent + tools (submit script, stop hook, auto-eval daemon)
     4. Run agent (high max-turns for iterative work)
     5. Read final state, extract archive
+
+    ``restored_registration`` opts into an already activated native checkpoint.
+    Supply the controller's original absolute activation deadline, not a new
+    duration. Setup and every resume consume that deadline; terminal collection
+    may drain previously accepted evaluations after work stops. Mismatched or
+    unavailable authority fails before work, with no cold-registration fallback.
+    The Agent must install its corresponding retained code/session/research state
+    through its ordinary installation path. Judge recovery alone does not prove
+    full worker continuity. This entry neither creates nor restores authority.
+    Periodic auto-evaluation must be disabled for this agent-only continuation.
     """
+    # Warm admission is explicit and does not invoke checkpoint restore itself.
+    # The caller must admit the matching worker state and arrange its installation.
+    if restored_registration is not None and (backend.backend_name != "docker" or task_spec.game_mode):
+        raise ValueError("Restored registration execution requires a non-game Docker task")
+    if restored_registration is not None and timeout is not None:
+        raise ValueError("Restored execution uses its original absolute deadline, not a new timeout")
+    if restored_registration is not None and not disable_auto_eval and eval_interval > 0:
+        raise ValueError("Restored agent-only execution requires automatic evaluation disabled")
     effective_timeout = timeout or config.agent_timeout or agent.timeout
 
     log_dir = config.log_dir / "runs" / run_id / task_spec.task_id
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(
-        f"agent.{task_spec.task_id}.{run_id}",
-        log_dir / "run_agent.log",
-        verbose=verbose,
+    # Admit exclusively before opening any run artifacts. Rejected retries must
+    # neither truncate evidence nor close a concurrent invocation's log handlers.
+    restored_execution = (
+        RestoredExecution(restored_registration, log_dir, run_id, task_spec.task_id, shutdown_event)
+        if restored_registration is not None else None
     )
+    try:
+        logger = setup_logger(
+            f"agent.{task_spec.task_id}.{run_id}",
+            log_dir / "run_agent.log",
+            mode="a" if restored_execution else "w",
+            verbose=verbose,
+        )
+    except BaseException:
+        if restored_execution is not None:
+            restored_execution.close()
+        raise
 
     # judge_url is for container use; derive a host-local URL for registration/polling
     parsed_judge = urlparse(judge_url)
@@ -360,12 +658,19 @@ def run_agent(
 
     handle = None
     net_isolation = None
+    # Cleanup and interruption handlers can run before installation completes.
+    auto_eval_stop = None
+    auto_eval_thread = None
+    auto_eval_started = False
+    auto_eval_joined = False
+    resume_count = 0
     install_parts: list[str] = []
     admin_secret = ""
-    auto_eval_stop = None
-    resume_count = 0
+    session_token = None
+    solver_execution = {"schema_version": 1, "status": "not_started", "segments": []}
 
     try:
+        _write_solver_execution(log_dir, solver_execution)
         admin_secret = get_admin_secret(config.log_dir)
         # 0. Clean up stale iptables chains from previous runs that were killed
         if backend.backend_name == "docker":
@@ -387,46 +692,64 @@ def run_agent(
                 )
         logger.info("Images ready")
 
-        # 1b. Register session with judge server
-        reg_body: dict = {"task_id": task_spec.task_id, "run_id": run_id, "admin_secret": admin_secret}
-        if config.judge_cpu_limit is not None:
-            reg_body["judge_cpu_limit"] = config.judge_cpu_limit
-        if config.judge_mem_limit is not None:
-            reg_body["judge_mem_limit"] = config.judge_mem_limit
-        if max_submissions is not None:
-            reg_body["max_agent_submissions"] = max_submissions
-        if submission_cooldown is not None:
-            reg_body["submission_cooldown"] = submission_cooldown
-        if backend.backend_name == "k8s":
-            reg_body["backend"] = backend.backend_name
-            reg_body["k8s_image_registry"] = config.k8s_image_registry
-            reg_body["k8s_namespace"] = config.k8s_namespace
-            if config.k8s_node_selector:
-                reg_body["k8s_node_selector"] = config.k8s_node_selector
-            if config.k8s_kubeconfig:
-                reg_body["k8s_kubeconfig"] = config.k8s_kubeconfig
-        elif backend.backend_name == "e2b":
-            reg_body["backend"] = "e2b"
-            reg_body["e2b_template_map"] = config.e2b_template_map
-            reg_body["e2b_template_namespace"] = config.e2b_template_namespace
-            reg_body["e2b_sandbox_ttl"] = config.e2b_sandbox_ttl
-        for _reg_attempt in range(1, 6):
-            try:
-                reg_resp = requests.post(
-                    f"{host_judge_url}/api/v1/register",
-                    json=reg_body,
-                    timeout=10,
-                )
-                reg_resp.raise_for_status()
-                break
-            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
-                if _reg_attempt == 5:
-                    raise
-                wait = 2 * _reg_attempt
-                logger.warning("Register attempt %d/5 failed (%s), retrying in %ds...", _reg_attempt, exc, wait)
-                time.sleep(wait)
-        session_token = reg_resp.json()["token"]
-        logger.info("Registered session with judge server")
+        if restored_execution is not None:
+            registered = restored_execution.registration_result(host_judge_url, admin_secret)
+            for key, expected in (
+                ("max_agent_submissions", max_submissions),
+                ("submission_cooldown", submission_cooldown),
+                ("judge_cpu_limit", config.judge_cpu_limit),
+                ("judge_mem_limit", config.judge_mem_limit),
+            ):
+                if expected is not None and registered.get(key) != expected:
+                    raise ValueError(f"Restored registration conflicts with requested {key}")
+            session_token = registered["token"]
+            max_submissions = registered["max_agent_submissions"]
+            submission_cooldown = registered["submission_cooldown"]
+            logger.info("Reusing the exact live restored judge registration")
+        else:
+            # 1b. Register session with judge server
+            reg_body: dict = {"task_id": task_spec.task_id, "run_id": run_id, "admin_secret": admin_secret}
+            if config.judge_cpu_limit is not None:
+                reg_body["judge_cpu_limit"] = config.judge_cpu_limit
+            if config.judge_mem_limit is not None:
+                reg_body["judge_mem_limit"] = config.judge_mem_limit
+            if max_submissions is not None:
+                reg_body["max_agent_submissions"] = max_submissions
+            if submission_cooldown is not None:
+                reg_body["submission_cooldown"] = submission_cooldown
+            if backend.backend_name == "k8s":
+                reg_body["backend"] = backend.backend_name
+                reg_body["k8s_image_registry"] = config.k8s_image_registry
+                reg_body["k8s_namespace"] = config.k8s_namespace
+                if config.k8s_node_selector:
+                    reg_body["k8s_node_selector"] = config.k8s_node_selector
+                if config.k8s_kubeconfig:
+                    reg_body["k8s_kubeconfig"] = config.k8s_kubeconfig
+            elif backend.backend_name == "e2b":
+                reg_body["backend"] = "e2b"
+                reg_body["e2b_template_map"] = config.e2b_template_map
+                reg_body["e2b_template_namespace"] = config.e2b_template_namespace
+                reg_body["e2b_sandbox_ttl"] = config.e2b_sandbox_ttl
+            for _reg_attempt in range(1, 6):
+                try:
+                    reg_resp = requests.post(
+                        f"{host_judge_url}/api/v1/register",
+                        json=reg_body,
+                        timeout=10,
+                    )
+                    reg_resp.raise_for_status()
+                    break
+                except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                    if _reg_attempt == 5:
+                        raise
+                    wait = 2 * _reg_attempt
+                    logger.warning("Register attempt %d/5 failed (%s), retrying in %ds...", _reg_attempt, exc, wait)
+                    time.sleep(wait)
+            session_token = reg_resp.json()["token"]
+            logger.info("Registered session with judge server")
+
+        if restored_execution is not None:
+            restored_execution.remaining()
 
         # 2. Create container
         container_name = f"sforge.run.{task_spec.task_id}.{run_id}"
@@ -535,7 +858,8 @@ def run_agent(
                 f"Install step {i + 1}/{len(agent.install_cmds)}: {cmd}"
             )
             result = backend.exec_run_with_exit_code(
-                handle, f"/bin/bash -c {shlex.quote(cmd)}", timeout=600
+                handle, f"/bin/bash -c {shlex.quote(cmd)}",
+                timeout=restored_execution.timeout(600) if restored_execution else 600
             )
             install_parts.append(result.output)
             if result.timed_out:
@@ -548,6 +872,9 @@ def run_agent(
 
         (log_dir / "install_output.txt").write_text("\n".join(install_parts))
         logger.info("Agent installation complete")
+
+        if restored_execution is not None:
+            restored_execution.remaining()
 
         # 4. Install tools.
         #    Game-mode tasks skip sforge-submit (scoring is built into the
@@ -580,6 +907,7 @@ def run_agent(
                     daemon=True,
                 )
                 auto_eval_thread.start()
+                auto_eval_started = True
                 logger.info(f"Host-side auto-eval started (interval={effective_eval_interval}s)")
         elif not disable_stop_hook:
             agent.install_stop_hook(backend, handle, log_dir, logger)
@@ -624,7 +952,8 @@ def run_agent(
 
         # 6. Run agent (with auto-resume on abnormal exit)
         can_resume = not disable_auto_resume and agent.resume_cmd is not None
-        remaining_timeout = effective_timeout
+        remaining_timeout = restored_execution.remaining() if restored_execution else effective_timeout
+        resume_count = 0
         total_runtime = 0.0
         agent_timed_out = False
         all_output_parts: list[str] = []
@@ -640,6 +969,14 @@ def run_agent(
         on_chunk_cb = None
 
         while remaining_timeout > 0:
+            if restored_execution is not None:
+                try:
+                    remaining_timeout = restored_execution.remaining()
+                except TimeoutError:
+                    agent_timed_out = True
+                    break
+                if resume_count == 0:
+                    restored_execution.start_work()
             is_resume = resume_count > 0
             run_cmd = agent.format_run_cmd(
                 prompt_path, model=model,
@@ -653,18 +990,46 @@ def run_agent(
             else:
                 logger.info(f"Running agent: {run_cmd[:200]}... (timeout={remaining_timeout:.0f}s)")
 
-            seg_result = backend.exec_run_with_timeout(
-                handle,
-                ["/bin/bash", "-c", run_cmd],
-                timeout=int(remaining_timeout),
-                log_file=agent_live_log,
-                workdir=task_spec.cwd,
-                environment=env,
-                stream_to_stdout=verbose,
-                shutdown_event=shutdown_event,
-                log_append=is_resume,
-                on_chunk=on_chunk_cb,
-            )
+            segment = {
+                "index": len(solver_execution["segments"]) + 1,
+                "resume": is_resume, "backend": backend.backend_name,
+                "status": "pending", "started_at": time.time(),
+                "returned_exit_code": None, "native_exit_code": None,
+                "terminal_observed": None, "termination_signal": None,
+            }
+            solver_execution["segments"].append(segment)
+            solver_execution["status"] = "pending"
+            _write_solver_execution(log_dir, solver_execution)
+            if restored_execution is not None:
+                remaining_timeout = restored_execution.remaining()
+            try:
+                seg_result = backend.exec_run_with_timeout(
+                    handle,
+                    ["/bin/bash", "-c", run_cmd],
+                    timeout=int(remaining_timeout),
+                    log_file=agent_live_log,
+                    workdir=task_spec.cwd,
+                    environment=env,
+                    stream_to_stdout=verbose,
+                    shutdown_event=shutdown_event,
+                    log_append=is_resume,
+                    on_chunk=on_chunk_cb,
+                )
+            except BaseException as exc:
+                # A caller interruption or transport error does not establish a
+                # signal delivered to the solver or confirm that it stopped.
+                segment.update(status="unknown", error_type=type(exc).__name__,
+                               finished_at=time.time())
+                solver_execution["status"] = "unknown"
+                try:
+                    _write_solver_execution(log_dir, solver_execution)
+                except OSError:
+                    logger.warning("Could not persist solver exception evidence")
+                raise
+            segment.update(_solver_segment_result(
+                seg_result, shutdown_event is not None and shutdown_event.is_set()))
+            solver_execution["status"] = segment["status"]
+            _write_solver_execution(log_dir, solver_execution)
             all_output_parts.append(seg_result.output)
             total_runtime += seg_result.elapsed_seconds
 
@@ -684,7 +1049,8 @@ def run_agent(
                 logger.warning(f"Max resume attempts ({MAX_RESUMES}) reached")
                 break
 
-            remaining_timeout -= seg_result.elapsed_seconds
+            if restored_execution is None:
+                remaining_timeout -= seg_result.elapsed_seconds
             resume_count += 1
             logger.info(f"Agent exited after {seg_result.elapsed_seconds:.1f}s, will resume")
 
@@ -698,7 +1064,12 @@ def run_agent(
         # 7. Stop auto-eval thread before extracting final archive
         if auto_eval_stop is not None:
             auto_eval_stop.set()
-            logger.info("Auto-eval thread stopped")
+            # A set event does not cancel an in-flight submit HTTP request.
+            # Wait for the producer before interpreting an empty pending set.
+            auto_eval_thread.join(timeout=435)
+            auto_eval_joined = True
+            logger.info("Auto-eval stop requested")
+        auto_eval_finished = auto_eval_thread is None or not auto_eval_thread.is_alive()
 
         # 8. Extract final archive (tar of submit_paths)
         try:
@@ -713,28 +1084,27 @@ def run_agent(
 
         # 8. Collect results
         if task_spec.game_mode:
+            close_error = None
             try:
-                requests.post(
+                close_response = requests.post(
                     f"{host_judge_url}/api/v1/game/{run_id}/{task_spec.task_id}/close-all",
                     timeout=30,
                 )
-            except Exception:
-                logger.warning("Failed to close active game sessions")
+                close_response.raise_for_status()
+                closed = close_response.json().get("closed")
+                if type(closed) is not int or closed < 0:
+                    raise ValueError("Invalid game close response")
+            except (requests.RequestException, ValueError, AttributeError):
+                close_error = "game_close_failed"
+                logger.warning("Failed to confirm game session closure")
 
-            try:
-                history_resp = requests.get(
-                    f"{host_judge_url}/api/v1/history?token={session_token}",
-                    timeout=10,
-                )
-                history_resp.raise_for_status()
-                history = history_resp.json()
-            except Exception:
-                logger.warning("Failed to fetch run history from judge server")
-                history = {"run_id": run_id, "best_score": None, "entries": []}
-
-            (log_dir / "game_history.json").write_text(
-                json.dumps(history, indent=2, ensure_ascii=False)
+            grading = _wait_for_grading(
+                host_judge_url, session_token, admin_secret,
+                eval_timeout=task_spec.judge.eval_timeout,
+                shutdown_event=shutdown_event, logger=logger,
+                incomplete_reason=close_error,
             )
+            history = _write_grading(log_dir, "game_history.json", grading, run_id)
 
             game_entries = [
                 e for e in history.get("entries", []) if e.get("type") == "game"
@@ -760,6 +1130,9 @@ def run_agent(
                 timed_out=agent_timed_out,
                 runtime_seconds=runtime,
                 resume_count=resume_count,
+                grading_status=grading.status,
+                grading_reason=grading.reason,
+                solver_execution=solver_execution,
             )
             logger.info(
                 f"Done (game): best_score={best_score} ({best_round}), "
@@ -791,46 +1164,13 @@ def run_agent(
             except Exception:
                 pass
 
-            # Drain pending judge evaluations before querying final results
-            drain_deadline = time.time() + 900
-            while time.time() < drain_deadline:
-                try:
-                    h = requests.get(
-                        f"{host_judge_url}/api/v1/history",
-                        params={"token": session_token, "admin_secret": admin_secret},
-                        timeout=10,
-                    ).json()
-                    pending = [e for e in h.get("entries", []) if e.get("status") in ("running", "queued")]
-                    if not pending:
-                        break
-                    logger.info(f"Draining {len(pending)} pending judge evals...")
-                except Exception:
-                    break
-                time.sleep(15)
-            else:
-                logger.warning("Drain timed out after 15 min; some reports may be missing.")
-
-            # Query Judge Server for authoritative results (with admin_secret to get full history)
-            try:
-                history_resp = requests.get(
-                    f"{host_judge_url}/api/v1/history",
-                    params={"token": session_token, "admin_secret": admin_secret},
-                    timeout=10,
-                )
-                history_resp.raise_for_status()
-                history = history_resp.json()
-            except Exception:
-                logger.warning("Failed to fetch run history from judge server")
-                history = {
-                    "run_id": run_id, "best_score": None,
-                    "best_pass_rate": 0.0, "best_round": "",
-                    "agent_submissions": 0, "auto_submissions": 0,
-                    "entries": [],
-                }
-
-            (log_dir / "run_history.json").write_text(
-                json.dumps(history, indent=2, ensure_ascii=False)
+            grading = _wait_for_grading(
+                host_judge_url, session_token, admin_secret,
+                eval_timeout=task_spec.judge.eval_timeout,
+                shutdown_event=shutdown_event, logger=logger,
+                incomplete_reason=None if auto_eval_finished else "auto_eval_active",
             )
+            history = _write_grading(log_dir, "run_history.json", grading, run_id)
 
             best_pass_rate = history.get("best_pass_rate", 0.0)
             best_score_raw = history.get("best_score")
@@ -854,6 +1194,9 @@ def run_agent(
                 timed_out=agent_timed_out,
                 runtime_seconds=runtime,
                 resume_count=resume_count,
+                grading_status=grading.status,
+                grading_reason=grading.reason,
+                solver_execution=solver_execution,
             )
 
             logger.info(
@@ -883,26 +1226,18 @@ def run_agent(
         except Exception:
             pass
 
-        # Query judge server for results accumulated before interruption (full history)
+        grading = (_wait_for_grading(
+            host_judge_url, session_token, admin_secret,
+            eval_timeout=task_spec.judge.eval_timeout,
+            shutdown_event=shutdown_event, logger=logger, incomplete_reason="interrupted",
+        ) if session_token is not None else _GradingResult(None, "unknown", "interrupted"))
         try:
-            history_resp = requests.get(
-                f"{host_judge_url}/api/v1/history",
-                params={"token": session_token, "admin_secret": admin_secret},
-                timeout=10,
-            )
-            history_resp.raise_for_status()
-            history = history_resp.json()
-        except Exception:
-            history = {
-                "run_id": run_id, "best_score": None,
-                "best_pass_rate": 0.0, "best_round": "",
-                "agent_submissions": 0, "auto_submissions": 0,
-                "entries": [],
-            }
-
-        (log_dir / "run_history.json").write_text(
-            json.dumps(history, indent=2, ensure_ascii=False)
-        )
+            history_file = "game_history.json" if task_spec.game_mode else "run_history.json"
+            history = _write_grading(log_dir, history_file, grading, run_id)
+        except Exception as evidence_error:
+            logger.warning("Grading evidence unavailable (%s)", type(evidence_error).__name__)
+            history = grading.history or {}
+            grading.status, grading.reason = "unknown", "evidence_write_failed"
 
         best_pass_rate = history.get("best_pass_rate", 0.0)
         best_score_raw = history.get("best_score")
@@ -929,34 +1264,38 @@ def run_agent(
             agent_output="Stopped by user (Ctrl+C)",
             timed_out=False,
             resume_count=resume_count,
+            grading_status=grading.status,
+            grading_reason=grading.reason,
+            solver_execution=solver_execution,
         )
     except Exception as e:
         logger.error(f"Error: {e}\n{traceback.format_exc()}")
-        if backend.backend_name == "e2b":
-            # E2B transport or lifecycle failures must remain visible to the
-            # caller instead of being reported as a successful zero score.
+        grading = _GradingResult(None, "unknown", "harness_error")
+        history = {}
+        try:
+            if session_token is not None:
+                grading = _wait_for_grading(
+                    host_judge_url, session_token, admin_secret,
+                    eval_timeout=task_spec.judge.eval_timeout,
+                    shutdown_event=shutdown_event, logger=logger,
+                    incomplete_reason="harness_error",
+                )
+            history_file = "game_history.json" if task_spec.game_mode else "run_history.json"
+            history = _write_grading(log_dir, history_file, grading, run_id)
+        except Exception as evidence_error:
+            # Preserve the original harness exception if recording also fails.
+            logger.warning("Grading evidence unavailable (%s)", type(evidence_error).__name__)
+            history = grading.history or {}
+            grading.status, grading.reason = "unknown", "evidence_write_failed"
+        if restored_registration is not None or backend.backend_name == "e2b":
             raise
 
-        # Preserve the pre-E2B Docker/Kubernetes behavior.
-        try:
-            history_resp = requests.get(
-                f"{host_judge_url}/api/v1/history?token={session_token}",
-                timeout=10,
-            )
-            history_resp.raise_for_status()
-            history = history_resp.json()
-            best_pass_rate = history.get("best_pass_rate", 0.0)
-            best_score_raw = history.get("best_score")
-            best_score = float(best_score_raw) if best_score_raw is not None else None
-            best_round = history.get("best_round", "")
-            agent_subs = history.get("agent_submissions", 0)
-            auto_subs = history.get("auto_submissions", 0)
-        except Exception:
-            best_pass_rate = 0.0
-            best_score = None
-            best_round = ""
-            agent_subs = 0
-            auto_subs = 0
+        best_pass_rate = history.get("best_pass_rate", 0.0)
+        best_score_raw = history.get("best_score")
+        best_score = float(best_score_raw) if best_score_raw is not None else None
+        best_round = history.get("best_round", "")
+        agent_subs = history.get("agent_submissions", 0)
+        auto_subs = history.get("auto_submissions", 0)
 
         return RunResult(
             best_pass_rate=best_pass_rate,
@@ -968,21 +1307,32 @@ def run_agent(
             agent_output=str(e),
             timed_out=False,
             resume_count=locals().get("resume_count", 0),
+            grading_status=grading.status,
+            grading_reason=grading.reason,
+            solver_execution=solver_execution,
         )
     finally:
         if auto_eval_stop is not None:
             auto_eval_stop.set()
+            if auto_eval_started and not auto_eval_joined:
+                auto_eval_thread.join(timeout=435)
         if net_isolation is not None:
             try:
                 net_isolation.cleanup()
             except Exception as exc:
                 if logger:
                     logger.warning(f"Failed to cleanup network isolation: {exc}")
-        if threading.current_thread() is threading.main_thread():
-            prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-            print("\nStopping container, please wait... (Ctrl+C disabled during cleanup)")
-            backend.cleanup_container(handle, logger)
-            signal.signal(signal.SIGINT, prev_handler)
-        else:
-            backend.cleanup_container(handle, logger)
-        close_logger(logger)
+        try:
+            if threading.current_thread() is threading.main_thread():
+                prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+                try:
+                    print("\nStopping container, please wait... (Ctrl+C disabled during cleanup)")
+                    backend.cleanup_container(handle, logger)
+                finally:
+                    signal.signal(signal.SIGINT, prev_handler)
+            else:
+                backend.cleanup_container(handle, logger)
+        finally:
+            if restored_execution is not None:
+                restored_execution.close()
+            close_logger(logger)

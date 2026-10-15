@@ -50,6 +50,12 @@ class SForgeConfig:
     agent_effort: str | None = None
     agent_timeout: int | None = None
     agent_extra_env: dict[str, str] = field(default_factory=dict)
+    # Total judge slots shared by every launcher process on this host. Process-local
+    # pools multiply otherwise, so the cross-process bound is the one that matters.
+    judge_host_capacity: int | None = None
+    # Optional host-wide judge memory budget. Unknown judge memory is charged the
+    # full budget so unbounded tasks run one at a time.
+    judge_host_memory_capacity: str | None = None
 
     # Claude Code cache optimization — suppress the random cch attribution
     # header and dynamic system prompt sections that break prompt caching on
@@ -133,6 +139,7 @@ def load_config(cli_overrides: dict | None = None) -> SForgeConfig:
         "judge_max_outstanding_per_run": ["SFORGE_JUDGE_MAX_OUTSTANDING_PER_RUN"],
         "work_cpu_limit": ["SFORGE_WORK_CPU_LIMIT"],
         "work_mem_limit": ["SFORGE_WORK_MEM_LIMIT"],
+        "judge_host_memory_capacity": ["SFORGE_JUDGE_HOST_MEMORY_CAPACITY"],
         "log_dir": ["SFORGE_LOG_DIR"],
         "tasks_dir": ["SFORGE_TASKS_DIR"],
     }
@@ -171,6 +178,21 @@ def load_config(cli_overrides: dict | None = None) -> SForgeConfig:
             if "=" in item:
                 k, v = item.split("=", 1)
                 config.judge_extra_env[k.strip()] = v.strip()
+
+    # Reject invalid explicit host capacity instead of silently changing it.
+    for env_name, field_name in (
+        ("SFORGE_JUDGE_HOST_CAPACITY", "judge_host_capacity"),
+    ):
+        raw = os.environ.get(env_name, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"{env_name} must be a positive integer, got {raw!r}") from None
+        if value < 1:
+            raise ValueError(f"{env_name} must be >= 1, got {value}")
+        setattr(config, field_name, value)
 
     # Parse SFORGE_EXTRA_HOSTS: "host1:ip1,host2:ip2"
     extra_hosts_str = os.environ.get("SFORGE_EXTRA_HOSTS", "")

@@ -79,8 +79,16 @@ E2B 原生域名白名单直接放行。
 |------|------|
 | `SFORGE_WORK_CPU_LIMIT` | Work 容器的 CPU 核数（例如 `4`） |
 | `SFORGE_WORK_MEM_LIMIT` | Work 容器的内存限制（例如 `8g`） |
+| `SFORGE_JUDGE_HOST_CAPACITY` | 同一主机上所有 SForge Server 进程共享的 Docker Judge 槽位数（默认不启用；设为正整数开启） |
+| `SFORGE_JUDGE_HOST_MEMORY_CAPACITY` | 可选的主机级 Judge 内存预算（例如 `24g`）。已声明的 Judge 内存限制按实际字节计费；未声明限制的 Judge 占用整份预算，因此单独运行。 |
+| `SFORGE_JUDGE_HOST_SLOT_FILE` | 覆盖主机级槽位账本路径（默认 `/tmp/sforge-judge-host-slots.json`） |
+| `SFORGE_JUDGE_HOST_OWNER_FILE` | 覆盖崩溃恢复使用的 backend owner sidecar 路径（默认 `/tmp/sforge-judge-host-owners.json`） |
+| `SFORGE_JUDGE_HOST_MEMORY_FILE` | 覆盖主机级内存账本路径（默认 `/tmp/sforge-judge-host-memory.json`） |
 
 Judge CPU/内存限制目前通过 CLI 参数（`--judge-cpu-limit`、`--judge-mem-limit`）或实验 YAML（`judge_cpu_limit`、`judge_mem_limit`）设置，不通过环境变量读取。
+内存预算只控制准入，不替代容器内存限制；需要多个 Judge 共享预算时，应同时设置实际的 Judge 内存限制。Docker owner 异常退出后，只有同一 Docker Engine 确认孤儿 Judge 容器已清理，SForge 才会回收对应容量。
+
+主机预算仅针对 Docker Judge，并复用既有进程/运行准入队列。各 launcher 应一致设置，例如 `SFORGE_JUDGE_HOST_CAPACITY=8 SFORGE_JUDGE_HOST_MEMORY_CAPACITY=24g`；不设这两个变量则保留原进程级准入。清理失败时保留名额和内存预算，直到确认所拥有容器已移除；仅重启 launcher 不会释放预算。
 
 ## 容器后端变量
 

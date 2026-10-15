@@ -23,7 +23,7 @@ def test_startup_interrupt_preserves_history_and_cleanup(tmp_path, monkeypatch, 
     agent = SimpleNamespace(timeout=30, _config=config, default_model="fixture",
         model_env=None, augment_env=lambda env, model: None, install_cmds=["install"])
     task = SimpleNamespace(task_id="fixture", cwd="/workspace", submit_paths=["answer.txt"],
-        submit_exclude=[], game_mode=False, work_image_key="work", judge_image_key="judge",
+        submit_exclude=[], game_mode=False, judge=SimpleNamespace(eval_timeout=1), work_image_key="work", judge_image_key="judge",
         work=SimpleNamespace(cpu_limit=1, mem_limit="1g"))
     backend = SimpleNamespace(backend_name="k8s", image_exists=lambda key: at("images", True),
         remove_container_by_name=lambda name: None, create_container=lambda *a, **kw: handle,
