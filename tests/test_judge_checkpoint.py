@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -26,7 +27,9 @@ from unittest.mock import Mock
 import pytest
 from fastapi.testclient import TestClient
 from sforge.harness import judge_server as native
-from sforge.harness.checkpoint import _encode, _sha
+from sforge.harness.checkpoint import (
+    CheckpointUnavailable, _decode_manifest, _encode, _encode_manifest, _sha,
+)
 from sforge.harness.config import SForgeConfig
 
 
@@ -808,3 +811,246 @@ def test_restore_materialization_does_not_spend_remaining_cooldown(
     now[0] += 1
     assert submit(client, fresh, 11).json()["round_id"] == "agent-2"
     assert submit(client, fresh, 12).status_code == 429
+
+
+@pytest.mark.parametrize(
+    "score,direction,next_score", [(float("inf"), "minimize", 6),
+                                  (-float("inf"), "maximize", 8),
+                                  (float("nan"), "maximize", 8)],
+)
+def test_nonfinite_result_checkpoint_preserves_history_and_opportunities(
+    service, monkeypatch, score, direction, next_score,
+):
+    state, client = service
+    state.tasks["fixture"].judge.score_direction = direction
+    now = [10000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    original_grade = native.judge_submission
+
+    def grade(**kwargs):
+        report = original_grade(**kwargs).to_dict()
+        report["metrics"] = {
+            "bounds": [float("inf"), -float("inf"), float("nan"), None],
+            "literal": {"kind": "nan", "path": ["score"], "value": None},
+            "text": "Infinity",
+        }
+        return SimpleNamespace(to_dict=lambda: report)
+
+    token = register(state, client, max_agent_submissions=3, submission_cooldown=30)
+    first = submit(client, token, 7)
+    now[0] += 30
+    monkeypatch.setattr(native, "judge_submission", grade)
+    second = submit(client, token, score)
+    assert first.status_code == second.status_code == 200
+    source = copy.deepcopy((state.tokens, state.run_history, state.submissions))
+    source_result = client.get("/api/v1/result/" + second.json()["submission_id"],
+                               params={"token": token}).json()
+
+    point = capture(state, client, token)
+    assert point["incumbent"]["round"] == "agent-1"
+    assert point["opportunity"]["next_agent"] == 3
+    assert point["opportunity"]["remaining_cooldown_seconds"] == 30
+    assert (state.tokens, state.run_history, state.submissions) == source
+    manifest_path = state.config.log_dir / "checkpoints" / point["checkpoint_id"] / "manifest.json"
+
+    def reject_constant(value):
+        raise AssertionError("Checkpoint manifest contains a non-JSON constant: " + value)
+
+    manifest = json.loads(manifest_path.read_bytes(), parse_constant=reject_constant)
+    assert manifest["incumbent"]["round"] == "agent-1"
+    now[0] += 600  # Offline time cannot consume a retained cooldown.
+    response = restore(state, client, point)
+    assert response.status_code == 200, response.text
+    fresh = response.json()["token"]
+    retained = state.run_history["branch/fixture"]
+    assert len(retained) == 2 and retained[1]["round"] == "agent-2"
+    restored_score = retained[1]["score"]
+    assert math.isnan(restored_score) if math.isnan(score) else restored_score == score
+    restored_report = state.submissions[retained[1]["submission_id"]]["report"]
+    bounds = restored_report["metrics"]["bounds"]
+    assert bounds[:2] == [float("inf"), -float("inf")]
+    assert math.isnan(bounds[2]) and bounds[3] is None
+    assert restored_report["metrics"]["literal"] == {
+        "kind": "nan", "path": ["score"], "value": None,
+    }
+    # Ordinary native report files keep their established json.loads format;
+    # the checkpoint's private strict-JSON representation does not leak here.
+    report_file = state.config.log_dir / "runs/branch/fixture/submissions/agent-2/report.json"
+    persisted = json.loads(report_file.read_bytes())
+    assert math.isnan(persisted["score"]) if math.isnan(score) else persisted["score"] == score
+    assert persisted["metrics"]["bounds"][:2] == bounds[:2]
+    assert math.isnan(persisted["metrics"]["bounds"][2])
+    restored_result = client.get("/api/v1/result/" + retained[1]["submission_id"],
+                                 params={"token": fresh}).json()
+    assert restored_result["report"] == source_result["report"]
+    assert history(client, fresh)["best_score"] == 7
+    recaptured = capture(state, client, fresh)
+    assert recaptured["incumbent"] == point["incumbent"]
+    assert recaptured["opportunity"]["next_agent"] == 3
+    assert submit(client, fresh, next_score).status_code == 429
+    now[0] += 29
+    assert submit(client, fresh, next_score).status_code == 429
+    now[0] += 1
+    assert submit(client, fresh, next_score).json()["round_id"] == "agent-3"
+    assert history(client, fresh)["best_score"] == next_score
+    assert submit(client, fresh, next_score).status_code == 429
+
+
+def test_manifest_codec_preserves_literal_objects_and_finite_v1_bytes():
+    literal = {"schema_version": "sforge_judge_checkpoint_v2", "nonfinite_values": [
+        {"kind": "nan", "path": ["score"], "value": None},
+    ]}
+    packet = {
+        "schema_version": "sforge_judge_checkpoint_v1",
+        "history": [{"score": 7.0}],
+        "results": {"synthetic": {"report": {"metrics": {
+            "literal": literal, "0": "Infinity", "finite": [None, True, 0, 1.5],
+        }}}},
+    }
+    finite_bytes = _encode(packet)
+    assert _encode_manifest(packet) == finite_bytes
+    assert _decode_manifest(finite_bytes) == packet
+    packet["results"]["synthetic"]["report"]["metrics"]["numbers"] = [
+        float("inf"), -float("inf"), float("nan"),
+    ]
+    before = copy.deepcopy(packet)
+    encoded = _encode_manifest(packet)
+    wire = json.loads(encoded, parse_constant=lambda value: pytest.fail(value))
+    assert wire["schema_version"] == "sforge_judge_checkpoint_v2"
+    assert packet == before  # Encoding cannot alter live grading/selection facts.
+    decoded = _decode_manifest(encoded)
+    metrics = decoded["results"]["synthetic"]["report"]["metrics"]
+    assert metrics["literal"] == literal and metrics["0"] == "Infinity"
+    assert metrics["finite"] == [None, True, 0, 1.5]
+    assert metrics["numbers"][:2] == [float("inf"), -float("inf")]
+    assert math.isnan(metrics["numbers"][2])
+    assert _encode_manifest(decoded) == encoded
+
+
+@pytest.mark.parametrize("key", [0, 1.25, False, None])
+def test_finite_v1_preserves_existing_json_object_key_encoding(key):
+    packet = {"schema_version": "sforge_judge_checkpoint_v1", "history": [],
+              "results": {"synthetic": {"report": {"metrics": {key: "literal"}}}}}
+    assert _encode_manifest(packet) == _encode(packet)
+
+
+def test_nonfinite_paths_follow_json_object_keys_without_mutating_source():
+    metrics = {1: float("inf"), 2: float("nan"), 3: "Infinity"}
+    packet = {"schema_version": "sforge_judge_checkpoint_v1", "history": [],
+              "results": {"synthetic": {"report": {"metrics": metrics}}}}
+    encoded = _encode_manifest(packet)
+    restored = _decode_manifest(encoded)["results"]["synthetic"]["report"]["metrics"]
+    assert restored["1"] == float("inf") and math.isnan(restored["2"])
+    assert restored["3"] == "Infinity" and set(metrics) == {1, 2, 3}
+    packet["results"]["synthetic"]["report"]["metrics"] = {1: float("inf"), "1": None}
+    with pytest.raises(CheckpointUnavailable, match="collide"):
+        _encode_manifest(packet)
+
+
+@pytest.mark.parametrize("fault", [
+    "unknown_schema", "v1_sidecar", "missing_sidecar", "empty_sidecar",
+    "extra_record_key", "unknown_kind", "duplicate_path", "missing_path",
+    "non_null_target", "authority_path", "boolean_index", "negative_index",
+    "string_index", "empty_path",
+])
+def test_manifest_codec_rejects_ambiguous_nonfinite_paths(fault):
+    wire = json.loads(_encode_manifest({
+        "schema_version": "sforge_judge_checkpoint_v1", "captured_at_epoch": None,
+        "history": [{"score": float("inf"), "passed": 1}], "results": {},
+    }))
+    entry = wire["nonfinite_values"][0]
+    if fault == "unknown_schema":
+        wire["schema_version"] = "sforge_judge_checkpoint_v99"
+    elif fault == "v1_sidecar":
+        wire["schema_version"] = "sforge_judge_checkpoint_v1"
+    elif fault == "missing_sidecar":
+        del wire["nonfinite_values"]
+    elif fault == "empty_sidecar":
+        wire["nonfinite_values"] = []
+    elif fault == "extra_record_key":
+        entry["value"] = "Infinity"
+    elif fault == "unknown_kind":
+        entry["kind"] = "infinite"
+    elif fault == "duplicate_path":
+        wire["nonfinite_values"].append(copy.deepcopy(entry))
+    elif fault == "missing_path":
+        entry["path"][-1] = "absent"
+    elif fault == "non_null_target":
+        entry["path"][-1] = "passed"
+    elif fault == "authority_path":
+        entry["path"] = ["captured_at_epoch"]
+    elif fault == "boolean_index":
+        entry["path"][1] = False
+    elif fault == "negative_index":
+        entry["path"][1] = -1
+    elif fault == "string_index":
+        entry["path"][1] = "0"
+    else:
+        entry["path"] = []
+    with pytest.raises(CheckpointUnavailable):
+        _decode_manifest(_encode(wire))
+
+
+@pytest.mark.parametrize("raw", [
+    b'{"schema_version":"sforge_judge_checkpoint_v1","history":[NaN]}',
+    b'{"schema_version":"sforge_judge_checkpoint_v1","history":[Infinity]}',
+    b'{"schema_version":"sforge_judge_checkpoint_v1","history":[-Infinity]}',
+    b'{"schema_version":"sforge_judge_checkpoint_v1","history":[1e999]}',
+    b'{"schema_version":"sforge_judge_checkpoint_v1","history":[],"history":[]}',
+])
+def test_manifest_codec_rejects_unmarked_numbers_and_duplicate_keys(raw):
+    with pytest.raises(CheckpointUnavailable):
+        _decode_manifest(raw)
+
+
+@pytest.mark.parametrize("score", [float("inf"), -float("inf"), float("nan")])
+def test_all_nonfinite_history_and_capture_retry_retain_native_selection(service, score):
+    state, client = service
+    token = register(state, client, max_agent_submissions=2)
+    submitted = submit(client, token, score)
+    assert submitted.status_code == 200
+    body = {"token": token, "admin_secret": state.admin_secret, "capture_id": "4" * 32}
+    first = client.post("/api/v1/checkpoint/capture", json=body)
+    assert first.status_code == 200, first.text
+    point = first.json()
+    assert point["incumbent"]["round"] == "agent-1"
+    # A new source submission must not change a retry's original history.
+    assert submit(client, token, 8).status_code == 200
+    assert client.post("/api/v1/checkpoint/capture", json=body).json() == point
+    restored = restore(state, client, point)
+    assert restored.status_code == 200, restored.text
+    fresh = restored.json()["token"]
+    assert state.resolve_token(fresh)["next_agent"] == 2
+    retained = state.run_history["branch/fixture"]
+    assert len(retained) == 1 and history(client, fresh)["best_round"] == "agent-1"
+    assert math.isnan(retained[0]["score"]) if math.isnan(score) else retained[0]["score"] == score
+    recaptured = capture(state, client, fresh)
+    assert recaptured["incumbent"] == point["incumbent"]
+
+
+@pytest.mark.parametrize("fault", ["history_value", "result_value", "duplicate_path", "unknown_schema"])
+def test_nonfinite_manifest_tamper_cannot_publish_restore(service, monkeypatch, fault):
+    state, client = service
+    token = register(state, client)
+    submit(client, token, float("nan"))
+    point = capture(state, client, token)
+    path = state.config.log_dir / "checkpoints" / point["checkpoint_id"] / "manifest.json"
+    wire = json.loads(path.read_bytes())
+    if fault in {"history_value", "result_value"}:
+        root = "history" if fault == "history_value" else "results"
+        entry = next(row for row in wire["nonfinite_values"] if row["path"][0] == root)
+        entry["kind"] = "positive_infinity"
+    elif fault == "duplicate_path":
+        wire["nonfinite_values"].append(copy.deepcopy(wire["nonfinite_values"][0]))
+    else:
+        wire["schema_version"] = "sforge_judge_checkpoint_v99"
+    path.write_bytes(_encode(wire))
+    point["manifest_sha256"] = _sha(path.read_bytes())
+    path.with_name("manifest.sha256").write_text(point["manifest_sha256"])
+    prepare = Mock(side_effect=AssertionError("Invalid capsule cannot prepare authority"))
+    monkeypatch.setattr(state, "_prepare_session", prepare)
+    response = restore(state, client, point)
+    assert response.status_code == 409, response.text
+    prepare.assert_not_called()
+    assert len(state.tokens) == 1 and len(state.submissions) == 1
+    assert not (state.config.log_dir / "runs/branch").exists()

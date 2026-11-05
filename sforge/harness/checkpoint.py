@@ -43,7 +43,9 @@ if TYPE_CHECKING:
     from sforge.harness.judge_server import JudgeState
 
 SCHEMA = "sforge_judge_checkpoint_v1"
+NONFINITE_SCHEMA = "sforge_judge_checkpoint_v2"
 RESTORE_MARKER = "checkpoint-origin.json"
+_NONFINITE_KINDS = {"positive_infinity": "inf", "negative_infinity": "-inf", "nan": "nan"}
 
 
 class CaptureRequest(BaseModel):
@@ -77,6 +79,120 @@ def _encode(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode()
+
+
+def _encode_manifest(packet: dict) -> bytes:
+    """Keep nonfinite result numbers lossless without non-JSON constants."""
+    values = []
+
+    def visit(value, path):
+        if isinstance(value, float) and not math.isfinite(value):
+            kind = "nan" if math.isnan(value) else (
+                "positive_infinity" if value > 0 else "negative_infinity"
+            )
+            values.append({"path": path, "kind": kind})
+            return None
+        if isinstance(value, dict):
+            # Match the existing JSON conversion of int/float/bool/None keys.
+            # Paths address that wire object, never the untouched live dict.
+            pairs = []
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    key = next(iter(json.loads(_encode({key: None}))))
+                pairs.append((key, item))
+            if len({key for key, _ in pairs}) != len(pairs):
+                raise CheckpointUnavailable("Checkpoint result keys collide in JSON")
+            return {key: visit(item, [*path, key]) for key, item in sorted(pairs)}
+        if isinstance(value, (list, tuple)):
+            return [visit(item, [*path, index]) for index, item in enumerate(value)]
+        return value
+
+    # Only released data has this representation. Provenance, resources and
+    # opportunity clocks retain their existing strict numeric validation.
+    data = {key: visit(packet[key], [key]) for key in ("history", "results")}
+    if not values:
+        return _encode(packet)  # Existing finite v1 bytes are unchanged.
+    return _encode({**packet, **data, "schema_version": NONFINITE_SCHEMA,
+                    "nonfinite_values": values})
+
+
+def _decode_manifest(encoded: bytes) -> dict:
+    """Decode v2 data before native validation; retain finite v1 compatibility."""
+    def finite_number(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise CheckpointUnavailable("Unmarked nonfinite checkpoint number")
+        return value
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise CheckpointUnavailable("Duplicate checkpoint object key")
+            result[key] = value
+        return result
+
+    packet = json.loads(encoded, parse_float=finite_number,
+                        parse_constant=finite_number, object_pairs_hook=unique_object)
+    if not isinstance(packet, dict):
+        raise CheckpointUnavailable("Invalid native checkpoint object")
+    if packet.get("schema_version") == SCHEMA:
+        if "nonfinite_values" in packet:
+            raise CheckpointUnavailable("Nonfinite values require checkpoint v2")
+        return packet
+    if packet.get("schema_version") != NONFINITE_SCHEMA:
+        raise CheckpointUnavailable("Unsupported native checkpoint schema")
+    values = packet.pop("nonfinite_values", None)
+    if not isinstance(values, list) or not values:
+        raise CheckpointUnavailable("Checkpoint v2 requires nonfinite value paths")
+
+    def lookup(container, key):
+        if isinstance(container, dict) and isinstance(key, str) and key in container:
+            return container[key]
+        if (isinstance(container, list) and type(key) is int
+                and 0 <= key < len(container)):
+            return container[key]
+        raise CheckpointUnavailable("Nonfinite checkpoint path is unavailable")
+
+    seen = set()
+    for entry in values:
+        if not isinstance(entry, dict) or set(entry) != {"path", "kind"}:
+            raise CheckpointUnavailable("Invalid nonfinite checkpoint value")
+        path, kind = entry["path"], entry["kind"]
+        if (not isinstance(path, list) or not path
+                or not all(type(key) is str or (type(key) is int and key >= 0) for key in path)
+                or path[0] not in {"history", "results"}
+                or not isinstance(kind, str) or kind not in _NONFINITE_KINDS):
+            raise CheckpointUnavailable("Invalid nonfinite checkpoint path or kind")
+        identity = tuple(path)
+        if identity in seen:
+            raise CheckpointUnavailable("Duplicate nonfinite checkpoint path")
+        seen.add(identity)
+        container = packet
+        for key in path[:-1]:
+            container = lookup(container, key)
+        if lookup(container, path[-1]) is not None:
+            raise CheckpointUnavailable("Nonfinite checkpoint value must replace null")
+        container[path[-1]] = float(_NONFINITE_KINDS[kind])
+    # v2 changes only the wire representation, not the native logical contract.
+    packet["schema_version"] = SCHEMA
+    return packet
+
+
+def _same_released_value(left, right) -> bool:
+    """NaNs in independent decoded history/report records denote the same value."""
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_released_value(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _same_released_value(a, b) for a, b in zip(left, right)
+        )
+    return left == right
 
 
 def _sha(raw: bytes) -> str:
@@ -171,7 +287,7 @@ class JudgeCheckpoints:
             expected_sha256 is not None and witnessed != expected_sha256
         ):
             raise CheckpointUnavailable("Checkpoint manifest digest differs")
-        packet = json.loads(encoded)
+        packet = _decode_manifest(encoded)
         self._validate(packet)
         incumbent = packet["incumbent"]
         if incumbent is not None:
@@ -251,15 +367,14 @@ class JudgeCheckpoints:
                         or not isinstance(result["error"], str)
                     )
                 )
-                or entry
-                != submission_history_entry(
+                or not _same_released_value(entry, submission_history_entry(
                     entry["submission_id"],
                     task_id,
                     entry["round"],
                     result["report"],
                     result["error"],
                     status,
-                )
+                ))
             ):
                 raise CheckpointUnavailable(
                     "Released native history and result details differ"
@@ -416,7 +531,7 @@ class JudgeCheckpoints:
                 "incumbent": incumbent,
             }
             self._validate(packet)
-            encoded = _encode(
+            encoded = _encode_manifest(
                 packet
             )  # Freeze all references before leaving native locks.
             self.bank.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -533,7 +648,12 @@ class JudgeCheckpoints:
                     if report is not None:
                         folder = destination / task_id / "submissions" / entry["round"]
                         folder.mkdir(parents=True)
-                        _write(folder / "report.json", _encode(report))
+                        # Native report.json uses json.dumps' Inf/NaN spelling
+                        # (run_evaluation); preserve that existing reader format.
+                        # Only the checkpoint capsule requires strict JSON.
+                        _write(folder / "report.json", json.dumps(
+                            report, indent=2, ensure_ascii=False
+                        ).encode())
                 incumbent = packet["incumbent"]
                 if incumbent is not None:
                     archive = _read(

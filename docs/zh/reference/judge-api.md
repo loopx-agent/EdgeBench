@@ -75,6 +75,24 @@ Token 是一个 32 字符的十六进制字符串，内部维护任务 ID、运�
 - `POST /api/v1/checkpoint/capture`：正文包含 `token`、`admin_secret`，可选 `capture_id`（调用者生成的 32 位十六进制操作 ID）。同一注册重试同一 ID 返回首次捕获的点，不采用后来的提交，也不重复保存；其他注册不能复用。省略该字段表示新的手动捕获。响应包含 `checkpoint_id`、`manifest_sha256`、题目/来源 run、已用轮次/剩余冷却，以及原生选优的 incumbent 轮次、大小和摘要。私有 capsule 保留已公开的 agent 历史、完整结果及被选中的归档，不包含提交或管理 token。归档按原始字节保留，不解包。
 - `POST /api/v1/checkpoint/restore`：正文包含 `checkpoint_id`、捕获响应中的 `manifest_sha256`、全新的 `run_id` 和当前 `admin_secret`。响应返回新的提交 token 和反馈 relay。控制器通过 `/api/v1/history?token=...` 和 `/api/v1/result/{submission_id}?token=...` 读回。历史结果使用新的查询 ID，原报告保持不变；`logs/runs/新run/checkpoint-origin.json` 保存来源映射，incumbent 保留原轮次。
 
+Capsule 的 manifest 始终使用严格 JSON。有限分数和指标继续使用
+`sforge_judge_checkpoint_v1`。历史或报告中存在非有限数值时，使用
+`sforge_judge_checkpoint_v2`：只将 `history`、`results` 中对应数值存为 `null`，
+并在顶层 `nonfinite_values` 列表记录原值，例如
+`{"path":["history",0,"score"],"kind":"positive_infinity"}`。
+kind 仅支持 `positive_infinity`、`negative_infinity`、`nan`；path 的每一项必须
+是确切的对象键或非负数组下标。这只是存储表示，不是缺失反馈。读取时先还原
+原始数值，再核对历史、结果和原生选优。报告中的同名字符串、相似形状的字典
+仍是普通数据。未知版本、重复或不存在的路径、非 null 目标、越过历史/结果
+范围的路径及未标记的非有限数字均拒绝。旧 reader 会拒绝 v2，不会将占位 null
+当成分数；新 reader 继续支持有限 v1 格式，但两种格式均保留原有精确源码/
+评测器绑定要求。
+
+恢复的 `report.json` 沿用正常评测生成的原生报告格式，保留 Python JSON 的
+`Infinity`、`-Infinity`、`NaN` 表示，不把 capsule 的路径编码带入普通报告。
+运行中的报告、选优和公开 API 投影保持原有语义；捕获和恢复不会把非有限分数
+改成零或缺失反馈。
+
 恢复不会评测或多消费一轮。后续提交仍由原生 `consume_round`、预算、冷却及选优规则决定。冷却在新注册发布时，从捕获时剩余的**时长**重新计时；离线等待和 capsule 物化既不会补发机会，也不会消耗这段时长；旧 capsule 不包含来源后来取得的提升。
 
 若恢复响应丢失，用**相同**的正文（`checkpoint_id`、`manifest_sha256`、`run_id` 及当前 `admin_secret`）调用 `POST /api/v1/checkpoint/restore-result`。响应结构与首次恢复相同，返回已发布的原提交 token；不创建注册、不重放评测、不重置冷却。后续提交发生后仍可读回，已用机会保持不变。来源标记必须匹配且原注册仍存活；缺失、错配、部分激活或已丢失的注册返回 409，管理授权错误返回 403，非法正文返回 422。评测进程重启后，仅凭磁盘来源标记不能重新生成凭证。此操作不恢复 runner 的阶段截止时间：控制器必须保存首次激活时的原截止时间，重试不能重新计一段预算。更换 `run_id` 是另一个分支，不是恢复原响应。

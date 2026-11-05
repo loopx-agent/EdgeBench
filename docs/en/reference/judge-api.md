@@ -81,6 +81,23 @@ Content-Type: application/json
 
 `capture_id` is an optional caller-generated 32-character hexadecimal operation ID. A retry for the same registration returns the original point, even after later submissions; it neither captures the later state nor writes another capsule. Another registration cannot reuse the ID. Omit it for a new manual capture. The response contains `checkpoint_id`, `manifest_sha256`, the task/source run, preserved opportunity counters and remaining cooldown, and the native-selected incumbent's round/size/digest. The private capsule contains all released agent history and full result reports plus the selected archive; it contains no session or admin token. Archive bytes remain opaque and are never extracted during capture/restore.
 
+Capsule manifests remain strict JSON. Finite history and reports keep the
+`sforge_judge_checkpoint_v1` representation. A report can legitimately retain a
+nonfinite score or metric; capsules containing those values use
+`sforge_judge_checkpoint_v2`. That representation replaces only the nonfinite
+numbers in `history` and `results` with `null`, and records each original value
+in the top-level `nonfinite_values` list, for example
+`{"path":["history",0,"score"],"kind":"positive_infinity"}`. Kinds are
+`positive_infinity`, `negative_infinity`, and `nan`; path components are exact
+object keys or nonnegative array indices. This is storage encoding, not missing
+feedback: the reader restores the original numbers before checking history,
+results, or the native-selected incumbent. Literal strings and similarly shaped
+objects in reports are ordinary data. Unknown versions, duplicate or unavailable
+paths, non-null targets, paths outside released data, and unmarked nonfinite
+numbers are rejected. Earlier readers reject v2 rather than treating its nulls
+as scores. New readers retain finite v1 format support; the existing exact
+native-source/evaluator binding still applies to both versions.
+
 ```http
 POST /api/v1/checkpoint/restore
 Content-Type: application/json
@@ -89,6 +106,12 @@ Content-Type: application/json
 ```
 
 The response issues a fresh submission token and feedback relay for `fresh-branch`. Read back from the controller with `/api/v1/history?token=...` and `/api/v1/result/{submission_id}?token=...`. Retained results have fresh lookup IDs and unchanged original reports; `logs/runs/fresh-branch/checkpoint-origin.json` records their source mapping. The selected archive is retained under its original round. Restore performs **no evaluation**. The next `/submit` uses the existing native counter, budget, cooldown and selection rules. Cooldown resumes from the captured remaining **duration** when the fresh registration is published; offline waiting and capsule materialization do not refill evaluation opportunities or spend that duration. A later source improvement is absent from an earlier capsule.
+
+Restored `report.json` files retain the ordinary native report format used by
+evaluation, including Python JSON's `Infinity`, `-Infinity`, and `NaN` spellings
+when present. They do not contain the capsule's path encoding. Live reports,
+selection, and public API projections keep their existing semantics; neither
+capture nor restore converts a nonfinite score to zero or missing feedback.
 
 If the restore response is lost, call `POST /api/v1/checkpoint/restore-result` with the **same** JSON body (`checkpoint_id`, `manifest_sha256`, `run_id`, and current `admin_secret`). It returns the original response shape and the already published submission token. It does not allocate another registration, replay grading, or restart cooldown. Readback also remains valid after subsequent submissions and preserves their consumed opportunities. The existing origin marker must match and the registration must still be live; a missing, mismatched, partial or lost registration returns 409. Wrong admin authority returns 403, and malformed bodies return 422. A persisted origin marker alone cannot recreate credentials after a judge process restart. This recovery does not recover a runner's phase deadline: its controller must retain the original activation-time deadline and must not initialize a new duration on retry. A new `run_id` represents a different branch, not recovery of this response.
 
