@@ -63,6 +63,17 @@ class RestoreRequest(BaseModel):
     admin_secret: str
 
 
+class AdoptTerminalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    checkpoint_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    task_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+    source_registration_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    capture_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    admin_secret: str
+
+
 class CheckpointUnavailable(ValueError):
     """No complete, compatible native registration can be preserved."""
 
@@ -81,7 +92,7 @@ def _encode(value: object) -> bytes:
     ).encode()
 
 
-def _encode_manifest(packet: dict) -> bytes:
+def _encode_manifest(packet: dict, *, nonfinite_schema: str = NONFINITE_SCHEMA) -> bytes:
     """Keep nonfinite result numbers lossless without non-JSON constants."""
     values = []
 
@@ -112,11 +123,12 @@ def _encode_manifest(packet: dict) -> bytes:
     data = {key: visit(packet[key], [key]) for key in ("history", "results")}
     if not values:
         return _encode(packet)  # Existing finite v1 bytes are unchanged.
-    return _encode({**packet, **data, "schema_version": NONFINITE_SCHEMA,
+    return _encode({**packet, **data, "schema_version": nonfinite_schema,
                     "nonfinite_values": values})
 
 
-def _decode_manifest(encoded: bytes) -> dict:
+def _decode_manifest(encoded: bytes, *, finite_schema: str = SCHEMA,
+                     nonfinite_schema: str = NONFINITE_SCHEMA) -> dict:
     """Decode v2 data before native validation; retain finite v1 compatibility."""
     def finite_number(text):
         value = float(text)
@@ -136,11 +148,11 @@ def _decode_manifest(encoded: bytes) -> dict:
                         parse_constant=finite_number, object_pairs_hook=unique_object)
     if not isinstance(packet, dict):
         raise CheckpointUnavailable("Invalid native checkpoint object")
-    if packet.get("schema_version") == SCHEMA:
+    if packet.get("schema_version") == finite_schema:
         if "nonfinite_values" in packet:
             raise CheckpointUnavailable("Nonfinite values require checkpoint v2")
         return packet
-    if packet.get("schema_version") != NONFINITE_SCHEMA:
+    if packet.get("schema_version") != nonfinite_schema:
         raise CheckpointUnavailable("Unsupported native checkpoint schema")
     values = packet.pop("nonfinite_values", None)
     if not isinstance(values, list) or not values:
@@ -175,7 +187,7 @@ def _decode_manifest(encoded: bytes) -> dict:
             raise CheckpointUnavailable("Nonfinite checkpoint value must replace null")
         container[path[-1]] = float(_NONFINITE_KINDS[kind])
     # v2 changes only the wire representation, not the native logical contract.
-    packet["schema_version"] = SCHEMA
+    packet["schema_version"] = finite_schema
     return packet
 
 
@@ -203,7 +215,7 @@ def _read(root: Path, path: Path) -> bytes:
     """Reject symlinks, non-files, replacement and writes during a read."""
     if not path.is_relative_to(root) or path.resolve(strict=True) != path:
         raise CheckpointUnavailable("Checkpoint file is outside its physical owner")
-    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as f:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as f:
         before = os.fstat(f.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise CheckpointUnavailable("Checkpoint component is not a regular file")
@@ -447,6 +459,7 @@ class JudgeCheckpoints:
                     )
                 # A retry reads the original point, never a later source state.
                 return self._reference(identifier, encoded, packet)
+            state._checkpoint_tail.require_available(info)
             if state._get_backend(run, task_id) is not state.backend:
                 raise CheckpointUnavailable(
                     "Checkpoint requires the configured Docker backend"
@@ -531,30 +544,39 @@ class JudgeCheckpoints:
                 "incumbent": incumbent,
             }
             self._validate(packet)
-            encoded = _encode_manifest(
-                packet
-            )  # Freeze all references before leaving native locks.
-            self.bank.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if (
-                self.bank.resolve() != self.bank
-                or stat.S_IMODE(self.bank.stat().st_mode) & 0o077
-            ):
-                raise CheckpointUnavailable("Checkpoint bank must be physically owned")
-            temporary = Path(tempfile.mkdtemp(prefix=".capture-", dir=self.bank))
-            try:
-                _write(temporary / "manifest.json", encoded)
-                _write(temporary / "manifest.sha256", _sha(encoded).encode("ascii"))
-                if raw is not None:
-                    _write(temporary / "incumbent.tar.gz", raw)
-                if destination.exists():
-                    raise CheckpointUnavailable("Checkpoint identifier already exists")
-                _sync_directory(temporary)
-                temporary.rename(destination)
-                _sync_directory(self.bank)
-            finally:
-                if temporary.exists():
-                    shutil.rmtree(temporary)
-            return self._reference(identifier, encoded, packet)
+            return self._publish_point(identifier, packet, raw)
+
+    def _publish_point(self, identifier: str, packet: dict, raw: bytes | None) -> dict:
+        """Publish an immutable point from already validated native facts."""
+        self._validate(packet)
+        encoded = _encode_manifest(packet)
+        destination = self.bank / _name(identifier)
+        if destination.exists():
+            retained, existing = self._packet(identifier)
+            if retained != encoded:
+                raise CheckpointUnavailable("Capture identity belongs to a different native point")
+            return self._reference(identifier, retained, existing)
+        self.bank.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if (
+            self.bank.resolve() != self.bank
+            or stat.S_IMODE(self.bank.stat().st_mode) & 0o077
+        ):
+            raise CheckpointUnavailable("Checkpoint bank must be physically owned")
+        temporary = Path(tempfile.mkdtemp(prefix=".capture-", dir=self.bank))
+        try:
+            _write(temporary / "manifest.json", encoded)
+            _write(temporary / "manifest.sha256", _sha(encoded).encode("ascii"))
+            if raw is not None:
+                _write(temporary / "incumbent.tar.gz", raw)
+            if destination.exists():
+                raise CheckpointUnavailable("Checkpoint identifier already exists")
+            _sync_directory(temporary)
+            temporary.rename(destination)
+            _sync_directory(self.bank)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+        return self._reference(identifier, encoded, packet)
 
     def restore_result(self, identifier: str, manifest_sha256: str, run_id: str) -> str:
         """Read an already published registration; never rehydrate authority.
@@ -730,6 +752,7 @@ class JudgeCheckpoints:
                         )
                         state.run_backends.pop(state._run_key(run_id, task_id), None)
                         state._checkpoint_runs.discard(run_id)
+                    state._checkpoint_tail.rollback(info["registration_id"])
                 shutil.rmtree(destination)
                 raise
 
@@ -739,6 +762,20 @@ def install_routes(app, state: JudgeState) -> None:
     from docker.errors import DockerException
 
     bank = JudgeCheckpoints(state)
+    from sforge.harness.checkpoint_tail import (
+        DurableRegistrations,
+        DurableWriteUnavailable,
+    )
+    state._checkpoint_tail = DurableRegistrations(state)
+
+    @app.exception_handler(DurableWriteUnavailable)
+    def durable_write_unavailable(request, error):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Native checkpoint storage is unavailable; original registration is retained"},
+        )
 
     def authorize(secret: str) -> None:
         import secrets
@@ -759,6 +796,16 @@ def install_routes(app, state: JudgeState) -> None:
             raise HTTPException(
                 409, "Native checkpoint source is incomplete or unavailable"
             ) from error
+
+    @app.post("/api/v1/checkpoint/adopt-terminal")
+    def adopt_terminal(request: AdoptTerminalRequest) -> dict:
+        authorize(request.admin_secret)
+        try:
+            return state._checkpoint_tail.adopt(**request.model_dump(exclude={"admin_secret"}))
+        except CheckpointUnavailable as error:
+            raise HTTPException(409, str(error)) from error
+        except (OSError, ValueError, KeyError, TypeError, DockerException) as error:
+            raise HTTPException(409, "Native durable tail is incomplete, active or incompatible") from error
 
     @app.post("/api/v1/checkpoint/restore")
     def restore(request: RestoreRequest) -> dict:
