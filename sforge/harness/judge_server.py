@@ -1403,10 +1403,14 @@ class JudgeState:
             executor.submit(self._grade_spooled, submission_id, task_id,
                                   spool, run_id, round_id, cpu, mem, kind)
         except BaseException as e:
-            self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
             try:
-                self._record_submission(run_id or submission_id, submission_id, task_id,
-                                        round_id, None, str(e), status="error")
+                if self._checkpoint_enabled:
+                    self._publish_terminal_result(submission_id, task_id, run_id,
+                                                  round_id, None, str(e), SubmissionStatus.ERROR)
+                else:
+                    self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
+                    self._record_submission(run_id or submission_id, submission_id, task_id,
+                                            round_id, None, str(e), status="error")
             finally:
                 try:
                     spool.unlink(missing_ok=True)
@@ -1452,9 +1456,13 @@ class JudgeState:
                     time.sleep(0.2)
             self._grade_worker(submission_id, task_id, spool.read_bytes(), run_id, round_id, cpu, mem)
         except Exception as e:
-            self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
-            self._record_submission(run_id or submission_id, submission_id, task_id,
-                                    round_id, None, str(e), status="error")
+            if self._checkpoint_enabled:
+                self._publish_terminal_result(submission_id, task_id, run_id,
+                                              round_id, None, str(e), SubmissionStatus.ERROR)
+            else:
+                self.submissions[submission_id].update(status=SubmissionStatus.ERROR, error=str(e))
+                self._record_submission(run_id or submission_id, submission_id, task_id,
+                                        round_id, None, str(e), status="error")
         finally:
             # A terminal report or cleanup exception does not establish that the
             # owned container disappeared. Retain both ledgers if Docker cannot
@@ -1514,21 +1522,42 @@ class JudgeState:
             )
             report_dict = report.to_dict()
             report_dict.pop("score_0_100", None)
-            with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.COMPLETED
-                self.submissions[submission_id]["report"] = report_dict
-                self._record_submission(log_run_id, submission_id, task_id, round, report_dict, None)
+            status, error = SubmissionStatus.COMPLETED, None
         except Exception as e:
-            with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.ERROR
-                self.submissions[submission_id]["error"] = str(e)
-                self._record_submission(log_run_id, submission_id, task_id, round, None, str(e), status=SubmissionStatus.ERROR)
+            logger.exception("Native evaluation failed")
+            report_dict, status, error = None, SubmissionStatus.ERROR, str(e)
+        self._publish_terminal_result(submission_id, task_id, run_id, round,
+                                      report_dict, error, status)
+
+    def _publish_terminal_result(self, submission_id: str, task_id: str,
+                                 run_id: str | None, round_id: str | None,
+                                 report: dict | None, error: str | None,
+                                 status: SubmissionStatus) -> bool:
+        """One publication order for grading and bounded-queue failures."""
+        log_run_id = run_id or submission_id
+        with self._registration_lock:
+            if self._checkpoint_enabled:
+                try:
+                    # Persistence failure is not a failed evaluation. Keep the
+                    # pending native result and block further admission/readback.
+                    self._record_submission(log_run_id, submission_id, task_id, round_id, report, error, status=status)
+                except Exception:
+                    info = self._checkpoint_tail.info(run_id, task_id)
+                    self._checkpoint_tail.failed.add(info["registration_id"])
+                    logger.exception("Native terminal result could not be durably released")
+                    return False
+            self.submissions[submission_id].update(status=status, report=report, error=error)
+            if not self._checkpoint_enabled:
+                self._record_submission(log_run_id, submission_id, task_id, round_id, report, error, status=status)
+            return True
 
     def get_result(self, submission_id: str) -> dict | None:
         if self._checkpoint_enabled:
             # A released result is visible only after its durable publication.
             with self._registration_lock:
                 value = self.submissions.get(submission_id)
+                if value is not None and value["status"] not in (SubmissionStatus.COMPLETED, SubmissionStatus.ERROR):
+                    self._checkpoint_tail.require_available(self._checkpoint_tail.info(value["run_id"], value["task_id"]))
                 return dict(value) if value is not None else None
         return self.submissions.get(submission_id)
 

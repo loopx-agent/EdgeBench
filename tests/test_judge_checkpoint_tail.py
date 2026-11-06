@@ -337,7 +337,9 @@ def test_acceptance_disk_failure_leaves_unsettled_reservation(service, monkeypat
 
     with monkeypatch.context() as patch:
         patch.setattr("sforge.harness.checkpoint_tail._write", fail)
-        with pytest.raises(OSError):
+        from sforge.harness.checkpoint_tail import DurableWriteUnavailable
+
+        with pytest.raises(DurableWriteUnavailable):
             state.submit("fixture", b"7", "source", "agent-1")
     body = adoption(state, token, prefix)
     app = restart(state)
@@ -482,3 +484,205 @@ sys.stdin.read()
             child.kill()
             child.wait(timeout=5)
         stop_reaper(app.state.judge)
+
+
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_terminal_storage_failure_is_not_released_as_a_grading_error(
+    service, monkeypatch, after_replace
+):
+    import threading
+
+    from sforge.harness import checkpoint_tail
+
+    state, client = service
+    token = register(state, client)
+    prefix = capture(state, client, token)
+    failed = threading.Event()
+    original_write = checkpoint_tail._atomic
+
+    def fail_terminal(path, raw):
+        value = json.loads(raw)
+        if any(
+            result["status"] in ("completed", "error")
+            for result in value["results"].values()
+        ):
+            if after_replace:
+                original_write(path, raw)
+            failed.set()
+            raise OSError("Synthetic terminal fsync failure")
+        return original_write(path, raw)
+
+    monkeypatch.setattr(checkpoint_tail, "_atomic", fail_terminal)
+    accepted = client.post(
+        "/api/v1/submit",
+        data={"token": token},
+        files={"archive": ("candidate.tar.gz", b"7")},
+    )
+    assert accepted.status_code == 200
+    assert failed.wait(5)
+    sid = accepted.json()["submission_id"]
+    # This read takes the production publication lock, so the writer failure
+    # has completed before its result can become observable.
+    assert client.get("/api/v1/result/" + sid, params={"token": token}).status_code == 503
+    assert state.submissions[sid]["status"] == "running"
+    assert (
+        state.submissions[sid]["report"] is None
+        and state.submissions[sid]["error"] is None
+    )
+    assert history(client, token)["entries"][0]["status"] == "running"
+    assert (
+        client.post(
+            "/api/v1/submit",
+            data={"token": token},
+            files={"archive": ("candidate.tar.gz", b"8")},
+        ).status_code
+        == 503
+    )
+    assert state.tokens[token]["next_agent"] == 2
+    assert (
+        client.post(
+            "/api/v1/checkpoint/capture",
+            json={
+                "token": token,
+                "capture_id": "c" * 32,
+                "admin_secret": state.admin_secret,
+            },
+        ).status_code
+        == 503
+    )
+    body = adoption(state, token, prefix)
+    app = restart(state)
+    try:
+        with TestClient(app) as fresh:
+            response = fresh.post("/api/v1/checkpoint/adopt-terminal", json=body)
+            # A fresh owner verifies actual persisted bytes after restart; the
+            # failed live owner may never publish a point from stale memory.
+            assert response.status_code == (200 if after_replace else 409)
+            assert app.state.judge.tokens == {}
+    finally:
+        stop_reaper(app.state.judge)
+
+
+@pytest.mark.parametrize("fault", ["uncertain_reservation", "closed_writer"])
+def test_unavailable_writer_cannot_capture_stale_memory(service, monkeypatch, fault):
+    from sforge.harness import checkpoint_tail
+
+    state, client = service
+    token = register(state, client)
+    prefix = capture(state, client, token)
+    if fault == "uncertain_reservation":
+        original_write = checkpoint_tail._atomic
+
+        def committed_then_failed(path, raw):
+            original_write(path, raw)
+            raise OSError("Synthetic post-replace fsync failure")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoint_tail, "_atomic", committed_then_failed)
+            response = client.post(
+                "/api/v1/submit",
+                data={"token": token},
+                files={"archive": ("candidate.tar.gz", b"7")},
+            )
+        assert response.status_code == 503
+        journal = json.loads(
+            (
+                state._checkpoint_tail.folder("source", "fixture") / "state.json"
+            ).read_bytes()
+        )
+        assert journal["opportunity"]["next_agent"] == 2
+        assert state.tokens[token]["next_agent"] == 1
+    else:
+        state._checkpoint_tail.close()
+    request = {"token": token, "admin_secret": state.admin_secret}
+    response = client.post(
+        "/api/v1/checkpoint/capture", json={**request, "capture_id": "c" * 32}
+    )
+    assert response.status_code == (503 if fault == "uncertain_reservation" else 409)
+    assert not (state.config.log_dir / "checkpoints" / ("c" * 32)).exists()
+    # Returning an already sealed point is an immutable read, not permission to
+    # seal a new point from memory whose durability is no longer established.
+    assert (
+        client.post(
+            "/api/v1/checkpoint/capture",
+            json={**request, "capture_id": prefix["checkpoint_id"]},
+        ).json()
+        == prefix
+    )
+
+
+@pytest.mark.parametrize("stage", ["registration", "reservation", "acceptance"])
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_durable_write_faults_hold_admission_and_new_capture(
+    service, monkeypatch, stage, after_replace
+):
+    from sforge.harness import checkpoint_tail
+
+    state, client = service
+    token = prefix = None
+    if stage != "registration":
+        token = register(state, client)
+        prefix = capture(state, client, token)
+    original_write = checkpoint_tail._atomic
+
+    def fail_stage(path, raw):
+        value = json.loads(raw)
+        matches = {
+            "registration": not value["reservations"],
+            "reservation": bool(value["reservations"])
+            and not value["accepted_archives"],
+            "acceptance": bool(value["accepted_archives"]),
+        }[stage]
+        if matches:
+            if after_replace:
+                original_write(path, raw)
+            raise OSError("Synthetic checkpoint publication failure")
+        return original_write(path, raw)
+
+    register_body = {
+        "task_id": "fixture",
+        "run_id": "source",
+        "admin_secret": state.admin_secret,
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint_tail, "_atomic", fail_stage)
+        if stage == "registration":
+            response = client.post("/api/v1/register", json=register_body)
+        else:
+            response = client.post(
+                "/api/v1/submit",
+                data={"token": token},
+                files={"archive": ("candidate.tar.gz", b"7")},
+            )
+    assert response.status_code == 503
+    assert state.submissions == {}
+    if stage == "registration":
+        assert state.tokens == {}
+        assert client.post("/api/v1/register", json=register_body).status_code == 404
+        assert state.tokens == {}
+    else:
+        assert (
+            client.post(
+                "/api/v1/submit",
+                data={"token": token},
+                files={"archive": ("candidate.tar.gz", b"8")},
+            ).status_code
+            == 503
+        )
+        request = {"token": token, "admin_secret": state.admin_secret}
+        assert (
+            client.post(
+                "/api/v1/checkpoint/capture", json={**request, "capture_id": "c" * 32}
+            ).status_code
+            == 503
+        )
+        assert not (state.config.log_dir / "checkpoints" / ("c" * 32)).exists()
+        assert (
+            client.post(
+                "/api/v1/checkpoint/capture",
+                json={**request, "capture_id": prefix["checkpoint_id"]},
+            ).json()
+            == prefix
+        )
+    # A retained failed registration is not a fresh opportunity on retry.
+    assert state._checkpoint_tail.folder("source", "fixture").is_dir()

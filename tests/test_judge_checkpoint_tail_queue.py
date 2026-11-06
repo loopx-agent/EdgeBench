@@ -17,6 +17,7 @@ from test_judge_checkpoint import service as _shared_service
 from test_judge_checkpoint_tail import adoption
 
 from sforge.harness import judge_server as native
+from sforge.harness import checkpoint_tail as tail
 from sforge.harness.checkpoint import (
     CheckpointUnavailable,
     _decode_manifest,
@@ -169,3 +170,51 @@ def test_tail_codec_keeps_finite_bytes_and_rejects_nonfinite_authority():
     with pytest.raises(CheckpointUnavailable, match="path or kind"):
         _decode_manifest(_encode(packet), finite_schema=TAIL_SCHEMA,
                          nonfinite_schema=TAIL_NONFINITE_SCHEMA)
+
+
+@pytest.mark.parametrize("entrypoint", ["executor", "spooled"])
+@pytest.mark.parametrize("after_replace", [False, True])
+def test_queue_error_with_uncertain_terminal_storage_is_not_published(
+    service, monkeypatch, entrypoint, after_replace,
+):
+    state, client = service
+    token = register(state, client)
+    state._capacity = threading.BoundedSemaphore(1)
+    original = tail._atomic
+
+    def fail_terminal(path, raw):
+        packet = json.loads(raw)
+        if any(value["status"] == "error" for value in packet["results"].values()):
+            if after_replace:
+                original(path, raw)
+            raise OSError("Synthetic terminal storage failure")
+        return original(path, raw)
+
+    monkeypatch.setattr(tail, "_atomic", fail_terminal)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Synthetic queue startup failure")
+
+    if entrypoint == "executor":
+        monkeypatch.setattr(state._executor, "submit", fail)
+        with pytest.raises(RuntimeError, match="queue startup"):
+            state.submit_for_token(token, b"7", "agent")
+    else:
+        monkeypatch.setattr(state, "_grade_worker", fail)
+        monkeypatch.setattr(state._executor, "submit", lambda fn, *args: fn(*args))
+        state.submit_for_token(token, b"7", "agent")
+    sid, value = next(iter(state.submissions.items()))
+    assert value["status"] == "queued" and value["report"] is None and value["error"] is None
+    assert state._capacity.acquire(blocking=False)
+    state._capacity.release()
+    assert not list((state.config.log_dir / "judge-pending").iterdir())
+    assert client.get("/api/v1/result/" + sid, params={"token": token}).status_code == 503
+    assert client.post("/api/v1/submit", data={"token": token},
+                       files={"archive": ("candidate.tar.gz", b"8")}).status_code == 503
+    assert client.post("/api/v1/checkpoint/capture", json={
+        "token": token, "admin_secret": state.admin_secret,
+    }).status_code == 503
+    assert state.tokens[token]["next_agent"] == 2
+    journal = json.loads((state._checkpoint_tail.folder("source", "fixture") / "state.json").read_bytes())
+    assert journal["opportunity"]["next_agent"] == 2
+    assert journal["results"][sid]["status"] == ("error" if after_replace else "queued")

@@ -459,6 +459,7 @@ class JudgeCheckpoints:
                     )
                 # A retry reads the original point, never a later source state.
                 return self._reference(identifier, encoded, packet)
+            state._checkpoint_tail.require_available(info)
             if state._get_backend(run, task_id) is not state.backend:
                 raise CheckpointUnavailable(
                     "Checkpoint requires the configured Docker backend"
@@ -761,8 +762,20 @@ def install_routes(app, state: JudgeState) -> None:
     from docker.errors import DockerException
 
     bank = JudgeCheckpoints(state)
-    from sforge.harness.checkpoint_tail import DurableRegistrations
+    from sforge.harness.checkpoint_tail import (
+        DurableRegistrations,
+        DurableWriteUnavailable,
+    )
     state._checkpoint_tail = DurableRegistrations(state)
+
+    @app.exception_handler(DurableWriteUnavailable)
+    def durable_write_unavailable(request, error):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Native checkpoint storage is unavailable; original registration is retained"},
+        )
 
     def authorize(secret: str) -> None:
         import secrets

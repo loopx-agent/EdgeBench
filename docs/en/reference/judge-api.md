@@ -125,7 +125,12 @@ requires the configured Docker backend and a non-game task. Each registration
 holds an exclusive filesystem writer lock. Counters are persisted before they
 become visible; a reserved round without an accepted archive or terminal result
 blocks recovery rather than disappearing. Invalid results and execution errors
-still consume their original rounds.
+still consume their original rounds. A storage failure is not a failed grade:
+the result remains pending, its readback and further admission return 503, and
+recovery remains blocked until the durable source is complete.
+An uncertain write or closed writer also prevents a new capture from stale
+memory. Replaying an already sealed capture ID only reads that historical point;
+it does not certify that the point includes later accepted work.
 
 After the source service has stopped, restart the **same compatible provider**
 against its original physical log directory and make an administrator request:
