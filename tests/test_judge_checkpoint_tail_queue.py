@@ -8,13 +8,16 @@ import hashlib
 import json
 import math
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 from test_judge_checkpoint import capture, history, register, restore, submit
 from test_judge_checkpoint import service as _shared_service
 from test_judge_checkpoint_tail import adoption
+from test_judge_checkpoint_docker import server
 
 from sforge.harness import judge_server as native
 from sforge.harness import checkpoint_tail as tail
@@ -218,3 +221,40 @@ def test_queue_error_with_uncertain_terminal_storage_is_not_published(
     journal = json.loads((state._checkpoint_tail.folder("source", "fixture") / "state.json").read_bytes())
     assert journal["opportunity"]["next_agent"] == 2
     assert journal["results"][sid]["status"] == ("error" if after_replace else "queued")
+
+
+@pytest.mark.parametrize("kind", ["agent", "auto"])
+@pytest.mark.parametrize("transport", ["asgi", "http"])
+def test_storage_failure_does_not_reveal_foreign_or_hidden_submission(service, monkeypatch, kind, transport):
+    state, client = service
+    owner = register(state, client, run="owner")
+    foreign = register(state, client, run="foreign")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Synthetic queue startup failure")
+
+    monkeypatch.setattr(state._executor, "submit", fail)
+    monkeypatch.setattr(state._checkpoint_tail, "release", fail)
+    with pytest.raises(RuntimeError, match="queue startup"):
+        state.submit_for_token(owner, b"7", kind)
+    sid = next(iter(state.submissions))
+    scope = server(client.app) if transport == "http" else nullcontext("")
+    with scope as url:
+        with requests.Session() as session:
+            session.trust_env = False
+            def get(path, **kwargs):
+                if transport == "http":
+                    return session.get(url + path, timeout=5, **kwargs)
+                return client.get(path, **kwargs)
+            assert get("/api/v1/result/" + sid, params={"token": owner}).status_code == 503
+            # An unrelated registration cannot distinguish missing, healthy or
+            # failed submissions. Scope must precede owner availability.
+            assert get("/api/v1/result/" + sid, params={"token": foreign}).status_code == 404
+            relay = state.feedback_relay_id(foreign)
+            assert get(f"/api/v1/feedback/{relay}/result/{sid}").status_code == 404
+            owner_relay = state.feedback_relay_id(owner)
+            expected = 503 if kind == "agent" else 404
+            assert get(f"/api/v1/feedback/{owner_relay}/result/{sid}").status_code == expected
+            if kind == "auto":
+                assert get("/api/v1/result/" + sid,
+                           params={"token": owner, "include_receipt": True}).status_code == 404

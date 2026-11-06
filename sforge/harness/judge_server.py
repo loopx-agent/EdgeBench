@@ -29,7 +29,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1251,19 +1251,23 @@ class JudgeState:
     ) -> dict | None:
         """Return a result only when the submission belongs to this registration."""
         info = self.resolve_token(token)
-        result = self.get_result(submission_id)
-        visible = bool(
-            result
-            and result.get("run_id") == info["run_id"]
-            and result.get("task_id") == info["task_id"]
-            and (
-                not agent_only
-                or (result.get("round") or "").startswith("agent-")
+        with self._registration_lock if self._checkpoint_enabled else nullcontext():
+            # Scope precedes availability: a foreign or hidden submission must
+            # stay indistinguishable from an absent ID even if its owner failed.
+            result = (self.submissions.get(submission_id) if self._checkpoint_enabled
+                      else self.get_result(submission_id))
+            visible = bool(
+                result
+                and result.get("run_id") == info["run_id"]
+                and result.get("task_id") == info["task_id"]
+                and (
+                    not agent_only
+                    or (result.get("round") or "").startswith("agent-")
+                )
             )
-        )
-        if not visible:
-            return None
-        return result
+            if not visible:
+                return None
+            return self.get_result(submission_id) if self._checkpoint_enabled else result
 
     def load_tasks(self) -> None:
         benchmark = load_benchmark(self.config.tasks_dir)
