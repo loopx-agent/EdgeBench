@@ -1385,6 +1385,13 @@ def run_agent(
 
             if not can_resume:
                 break
+            observe_resume = getattr(agent, "resume_block_reason", None)
+            resume_block = observe_resume(seg_result) if observe_resume is not None else None
+            if resume_block is not None:
+                segment["resume_block_reason"] = resume_block
+                _write_solver_execution(log_dir, solver_execution)
+                logger.warning("Agent restart blocked by terminal provider failure: %s", resume_block)
+                break
             if seg_result.elapsed_seconds < MIN_RUNTIME_FOR_RESUME:
                 logger.warning(
                     f"Agent exited after only {seg_result.elapsed_seconds:.1f}s "

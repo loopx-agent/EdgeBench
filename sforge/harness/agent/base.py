@@ -65,6 +65,14 @@ class Agent(abc.ABC):
         mirrors, extra_env) have already been applied.
         """
 
+    def resume_block_reason(self, result) -> str | None:
+        """Provider-owned terminal reason that an identical restart cannot repair.
+
+        None preserves the normal bounded resume policy. Implementations must
+        inspect only this invocation's native failure, never previous output.
+        """
+        return None
+
     def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
         """Return host-only upstream authentication headers for *api_key*.
 

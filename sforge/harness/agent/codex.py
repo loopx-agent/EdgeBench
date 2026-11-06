@@ -53,6 +53,24 @@ fi''',
     stop_hook = "codex"
     credential_env_names = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
+    def resume_block_reason(self, result) -> str | None:
+        # The text-mode CLI does not expose a typed terminal envelope. Limit
+        # this fallback to its exact terminal diagnostic, on a failed process.
+        # Generic 429s, quoted messages and successful runs keep normal policy.
+        if result.exit_code == 0 or result.timed_out:
+            return None
+        lines = result.output[-4096:].rstrip().splitlines()
+        if len(lines) >= 2 and lines[-2] == "tokens used":
+            if not lines[-1].replace(",", "").isdigit():
+                return None
+            lines = lines[:-2]
+        if not lines:
+            return None
+        message = lines[-1].replace("’", "'")
+        if message.startswith("ERROR: You've hit your usage limit."):
+            return "usage_limit"
+        return None
+
     def credential_proxy_headers(self, api_key: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {api_key}"}
 
