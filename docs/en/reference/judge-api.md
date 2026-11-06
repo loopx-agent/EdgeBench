@@ -115,6 +115,63 @@ capture nor restore converts a nonfinite score to zero or missing feedback.
 
 If the restore response is lost, call `POST /api/v1/checkpoint/restore-result` with the **same** JSON body (`checkpoint_id`, `manifest_sha256`, `run_id`, and current `admin_secret`). It returns the original response shape and the already published submission token. It does not allocate another registration, replay grading, or restart cooldown. Readback also remains valid after subsequent submissions and preserves their consumed opportunities. The existing origin marker must match and the registration must still be live; a missing, mismatched, partial or lost registration returns 409. Wrong admin authority returns 403, and malformed bodies return 422. A persisted origin marker alone cannot recreate credentials after a judge process restart. This recovery does not recover a runner's phase deadline: its controller must retain the original activation-time deadline and must not initialize a new duration on retry. A new `run_id` represents a different branch, not recovery of this response.
 
+#### Adopting a terminal durable tail after the judge stops
+
+With the same `--checkpoints` flag, native registrations now persist reservations,
+accepted archive bytes/digests and terminal reports under the private
+`logs/checkpoint-registrations/<run>/<task>/` owner. There is no second logging
+switch. Pull/build the pinned judge image before registering: this opt-in path
+requires the configured Docker backend and a non-game task. Each registration
+holds an exclusive filesystem writer lock. Counters are persisted before they
+become visible; a reserved round without an accepted archive or terminal result
+blocks recovery rather than disappearing. Invalid results and execution errors
+still consume their original rounds.
+
+After the source service has stopped, restart the **same compatible provider**
+against its original physical log directory and make an administrator request:
+
+```http
+POST /api/v1/checkpoint/adopt-terminal
+Content-Type: application/json
+
+{"checkpoint_id":"11111111111111111111111111111111","manifest_sha256":"ORIGINAL_PREFIX_64_CHARACTER_SHA256","source_run_id":"source","task_id":"example-task","source_registration_id":"22222222222222222222222222222222","capture_id":"33333333333333333333333333333333","admin_secret":"CURRENT_CONTROLLER_SECRET"}
+```
+
+Read the original registration ID from its private `state.json`; use the exact
+prior capture reference (or the original restore reference for a continuation).
+The endpoint verifies that sealed prefix, any restore ID map, every subsequent
+reservation/archive/result, and source/task/image/resource pins. The source
+writer must be gone; copying its files to another directory cannot bypass its
+lock. It returns a **new immutable checkpoint reference**, creates no token and
+leaves the old point unchanged. Repeating the same request returns that point;
+a conflicting capture ID is refused. Consume the returned reference through the
+existing `restore` endpoint and read back history/results. The new manifest's
+`durable_tail` records the prefix, durable-state digest, last acceptance time and
+inherited ID map. Restore still assigns new result lookup IDs, without regrading.
+
+Remaining cooldown is frozen at the last durable observation, conservatively
+excluding unobserved time before process death and all downtime. A live writer,
+missing/altered archive, pending grade, counter gap, changed prefix, copied source,
+or incompatible provider returns 409 and publishes no token or point. Existing
+report folders, `checkpoint-origin.json`, or a successful worker exit **alone**
+are not an admission/drain record: older runs without this durable owner remain
+unqualified. Do not edit counters or remove invalid rounds to make them qualify.
+
+The bounded submission queue records acceptance before its evaluator starts.
+Graceful shutdown drains accepted evaluations before releasing the registration
+writer. A failed acceptance write retains its spent reservation but releases the
+queue slot; it cannot be treated as an unspent submission or a complete tail.
+Finite journals retain the v1 representation. Non-finite result numbers use the
+existing lossless checkpoint codec with `sforge_judge_registration_tail_v2`;
+only history/results support that encoding, never provenance or budget clocks.
+
+This retains each accepted archive once, in addition to the normal grading
+artifacts; disk use grows with submissions. No automatic pruning runs. Retain the
+original store until an administrator has verified the new point and receiver;
+then archive/remove it explicitly while its writer is stopped. Cleanup is not
+permission to reset the old run ID. Without `--checkpoints`, these writes,
+locks and recovery routes are absent and ordinary execution is unchanged.
+
 This version supports settled non-game registrations on the configured Docker backend, with no automatic evaluations. The native Python source, full task specification, actual Docker judge image ID, selection policy/direction and effective CPU/memory limits are bound. Missing/moved bytes, mismatched evaluator facts, queued/running results, consumed rounds without released history, conflicting result/history records and unsupported profiles return 409. Wrong admin authority returns 403; malformed request bodies return 422. Existing run identities, replayed restores and interrupted destination reservations are rejected rather than reset. An ordinary retry can recover an exception rolled back before completion; a process crash leaving a reservation fails closed and needs controller inspection. An accepted restore reserves the entire destination run ID, including against later cold registration while this feature is enabled.
 
 The bank is trusted private controller storage. SHA-256 detects disagreement with the controller's captured reference; it does not authenticate a malicious administrator, certify arbitrary report contents as credential-free, or make a worker checkpoint complete. Restore does not restore worker code beyond the incumbent archive, model sessions, research state, external-effect authority, or the runner's remaining total time budget. A continuation runner must preserve those separately before treating branches as comparable. Do not restart a restored run as a cold registration after disabling checkpoints.
