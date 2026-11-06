@@ -462,7 +462,10 @@ def test_real_terminal_tail_restarts_and_preserves_native_opportunities(tmp_path
         response.raise_for_status()
         sid = response.json()["submission_id"]
         def terminal():
-            result = requests.get(url + "/api/v1/result/" + sid, timeout=10).json()
+            response = requests.get(url + "/api/v1/result/" + sid,
+                                    params={"token": token}, timeout=10)
+            response.raise_for_status()
+            result = response.json()
             return result if result["status"] in ("completed", "error") else None
         return response.json(), wait_for(terminal)
 
