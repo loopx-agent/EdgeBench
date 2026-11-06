@@ -1524,7 +1524,8 @@ class JudgeState:
             report_dict.pop("score_0_100", None)
             status, error = SubmissionStatus.COMPLETED, None
         except Exception as e:
-            logger.exception("Native evaluation failed")
+            if self._checkpoint_enabled:
+                logger.exception("Native evaluation failed")
             report_dict, status, error = None, SubmissionStatus.ERROR, str(e)
         self._publish_terminal_result(submission_id, task_id, run_id, round,
                                       report_dict, error, status)
