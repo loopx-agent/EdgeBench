@@ -21,6 +21,7 @@ import logging
 from pathlib import Path, PurePosixPath
 
 from sforge.harness.agent.base import Agent
+from sforge.harness.backend.base import StreamingExecResult
 from sforge.harness.backend import ContainerBackend, ContainerHandle
 
 
@@ -53,7 +54,7 @@ fi''',
     stop_hook = "codex"
     credential_env_names = ("OPENAI_API_KEY", "CODEX_API_KEY")
 
-    def resume_block_reason(self, result) -> str | None:
+    def resume_block_reason(self, result: StreamingExecResult) -> str | None:
         # The text-mode CLI does not expose a typed terminal envelope. Limit
         # this fallback to its exact terminal diagnostic, on a failed process.
         # Generic 429s, quoted messages and successful runs keep normal policy.

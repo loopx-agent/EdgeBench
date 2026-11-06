@@ -22,6 +22,7 @@ from pathlib import Path
 
 from sforge.harness.backend import ContainerBackend, ContainerHandle
 from sforge.harness.config import SForgeConfig
+from sforge.harness.backend.base import StreamingExecResult
 
 
 class Agent(abc.ABC):
@@ -65,7 +66,7 @@ class Agent(abc.ABC):
         mirrors, extra_env) have already been applied.
         """
 
-    def resume_block_reason(self, result) -> str | None:
+    def resume_block_reason(self, result: StreamingExecResult) -> str | None:
         """Provider-owned terminal reason that an identical restart cannot repair.
 
         None preserves the normal bounded resume policy. Implementations must
