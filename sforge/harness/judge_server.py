@@ -598,21 +598,32 @@ class JudgeState:
             )
             report_dict = report.to_dict()
             report_dict.pop("score_0_100", None)
-            with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.COMPLETED
-                self.submissions[submission_id]["report"] = report_dict
-                self._record_submission(log_run_id, submission_id, task_id, round, report_dict, None)
+            status, error = SubmissionStatus.COMPLETED, None
         except Exception as e:
-            with self._registration_lock:
-                self.submissions[submission_id]["status"] = SubmissionStatus.ERROR
-                self.submissions[submission_id]["error"] = str(e)
-                self._record_submission(log_run_id, submission_id, task_id, round, None, str(e), status=SubmissionStatus.ERROR)
+            logger.exception("Native evaluation failed")
+            report_dict, status, error = None, SubmissionStatus.ERROR, str(e)
+        with self._registration_lock:
+            if self._checkpoint_enabled:
+                try:
+                    # Persistence failure is not a failed evaluation. Keep the
+                    # pending native result and block further admission/readback.
+                    self._record_submission(log_run_id, submission_id, task_id, round, report_dict, error, status=status)
+                except Exception:
+                    info = self._checkpoint_tail.info(run_id, task_id)
+                    self._checkpoint_tail.failed.add(info["registration_id"])
+                    logger.exception("Native terminal result could not be durably released")
+                    return
+            self.submissions[submission_id].update(status=status, report=report_dict, error=error)
+            if not self._checkpoint_enabled:
+                self._record_submission(log_run_id, submission_id, task_id, round, report_dict, error, status=status)
 
     def get_result(self, submission_id: str) -> dict | None:
         if self._checkpoint_enabled:
             # A released result is visible only after its durable publication.
             with self._registration_lock:
                 value = self.submissions.get(submission_id)
+                if value is not None and value["status"] not in (SubmissionStatus.COMPLETED, SubmissionStatus.ERROR):
+                    self._checkpoint_tail.require_available(self._checkpoint_tail.info(value["run_id"], value["task_id"]))
                 return dict(value) if value is not None else None
         return self.submissions.get(submission_id)
 

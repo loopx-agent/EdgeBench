@@ -36,6 +36,10 @@ from sforge.harness.checkpoint import (
 TAIL_SCHEMA = "sforge_judge_registration_tail_v1"
 
 
+class DurableWriteUnavailable(RuntimeError):
+    """The native owner cannot acknowledge more facts after a storage failure."""
+
+
 def _atomic(path: Path, raw: bytes) -> None:
     fd, name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
     temporary = Path(name)
@@ -91,6 +95,7 @@ class DurableRegistrations:
         self.bank = JudgeCheckpoints(state)
         self.root = self.bank.root / "checkpoint-registrations"
         self.writers = {}
+        self.failed = set()
         self.closed = False
 
     def folder(self, run_id, task_id):
@@ -162,11 +167,22 @@ class DurableRegistrations:
             # reached durable storage after an I/O error.
             raise
 
-    def _load(self, info):
+    def require_available(self, info):
+        if info["registration_id"] in self.failed:
+            raise DurableWriteUnavailable("Native checkpoint storage is unavailable")
         if self.closed or info["registration_id"] not in self.writers:
             raise CheckpointUnavailable("Original native writer is unavailable")
+
+    def _load(self, info):
+        self.require_available(info)
         folder = self.writers[info["registration_id"]][1]
-        return folder, json.loads(_read(self.bank.root, folder / "state.json"))
+        try:
+            return folder, json.loads(_read(self.bank.root, folder / "state.json"))
+        except (OSError, ValueError, TypeError) as error:
+            self.failed.add(info["registration_id"])
+            raise DurableWriteUnavailable(
+                "Native checkpoint storage is unavailable"
+            ) from error
 
     def _save(self, info, value):
         if self.closed:
@@ -186,7 +202,13 @@ class DurableRegistrations:
                 )
             },
         }
-        _atomic(folder / "state.json", _encode(value))
+        try:
+            _atomic(folder / "state.json", _encode(value))
+        except (OSError, ValueError, TypeError) as error:
+            self.failed.add(info["registration_id"])
+            raise DurableWriteUnavailable(
+                "Native checkpoint storage is unavailable"
+            ) from error
 
     def reserve(self, info):
         _, value = self._load(info)
@@ -227,8 +249,14 @@ class DurableRegistrations:
         if round_id not in value["reservations"]:
             raise CheckpointUnavailable("Native acceptance has no durable reservation")
         archive_path = folder / (round_id + ".tar.gz")
-        _write(archive_path, archive)
-        _sync_directory(folder)
+        try:
+            _write(archive_path, archive)
+            _sync_directory(folder)
+        except OSError as error:
+            self.failed.add(info["registration_id"])
+            raise DurableWriteUnavailable(
+                "Native accepted archive storage is unavailable"
+            ) from error
         value["accepted_archives"][round_id] = {
             "submission_id": submission_id,
             "archive_sha256": _sha(archive),
