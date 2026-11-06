@@ -390,3 +390,82 @@ print('native next work and grade completed')
         docker_client.images.remove(work_tag)
         docker_client.close()
         assert not leftovers, "Native grade failed to clean up its own containers"
+
+
+def test_real_terminal_tail_restarts_and_preserves_native_opportunities(tmp_path):
+    """Real HTTP -> Docker grades -> service stop -> adoption -> next grade."""
+    import hashlib
+    import docker
+    import requests
+    from test_judge_checkpoint import task_files
+    from sforge.harness import judge_server as native
+    from sforge.harness.config import SForgeConfig
+
+    name = "checkpoint-tail-" + uuid.uuid4().hex[:10]
+    docker_client = docker.from_env()
+    base = docker_client.images.get("python:3.12-slim")
+    task_files(tmp_path / "tasks")
+    (tmp_path / "tasks/BENCHMARK.yaml").write_text(f"name: {name}\nbase_images: {{python: {{}}}}\n")
+    task_path = tmp_path / "tasks/fixture.json"
+    task = json.loads(task_path.read_bytes())
+    task["judge"]["eval_cmd"] = '''python3 -c 'import json; d=json.load(open("candidate.json")); print(json.dumps(dict(score=d["score"], valid=d["score"]>=0)))' '''.strip()
+    task_path.write_text(json.dumps(task))
+    image_tag = f"{name}.judge.fixture:fixture"
+    base.tag(f"{name}.judge.fixture", tag="fixture")
+    config = SForgeConfig(tasks_dir=tmp_path / "tasks", log_dir=tmp_path / "logs",
+                         judge_cpu_limit=1, judge_mem_limit="256m")
+    source = native.create_app(config, checkpoints=True)
+
+    def post(url, path, data):
+        response = requests.post(url + path, json=data, timeout=20)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def grade(url, token, score):
+        response = requests.post(url + "/api/v1/submit", data={"token": token},
+                                 files={"archive": ("candidate.tar.gz", candidate(score))}, timeout=20)
+        response.raise_for_status()
+        sid = response.json()["submission_id"]
+        def terminal():
+            result = requests.get(url + "/api/v1/result/" + sid, timeout=10).json()
+            return result if result["status"] in ("completed", "error") else None
+        return response.json(), wait_for(terminal)
+
+    try:
+        with server(source) as url:
+            owner = source.state.judge
+            token = post(url, "/api/v1/register", {"task_id": "fixture", "run_id": "source",
+                         "max_agent_submissions": 4, "submission_cooldown": 0,
+                         "admin_secret": owner.admin_secret})["token"]
+            assert grade(url, token, 7)[1]["report"]["score"] == 7
+            prefix = post(url, "/api/v1/checkpoint/capture", {"token": token, "admin_secret": owner.admin_secret})
+            prefix_path = config.log_dir / "checkpoints" / prefix["checkpoint_id"] / "manifest.json"
+            prefix_digest = hashlib.sha256(prefix_path.read_bytes()).hexdigest()
+            restored = post(url, "/api/v1/checkpoint/restore", {"checkpoint_id": prefix["checkpoint_id"],
+                            "manifest_sha256": prefix["manifest_sha256"], "run_id": "continuation",
+                            "admin_secret": owner.admin_secret})["token"]
+            assert grade(url, restored, -1)[1]["report"]["valid"] is False
+            assert grade(url, restored, 9)[1]["report"]["score"] == 9
+            body = {"checkpoint_id": prefix["checkpoint_id"], "manifest_sha256": prefix["manifest_sha256"],
+                    "source_run_id": "continuation", "task_id": "fixture",
+                    "source_registration_id": owner.tokens[restored]["registration_id"],
+                    "capture_id": "d" * 32, "admin_secret": owner.admin_secret}
+            assert requests.post(url + "/api/v1/checkpoint/adopt-terminal", json=body, timeout=20).status_code == 409
+        assert source.state.judge._checkpoint_tail.closed
+        receiver = native.create_app(config, checkpoints=True)
+        with server(receiver) as url:
+            point = post(url, "/api/v1/checkpoint/adopt-terminal", body)
+            assert point["opportunity"]["next_agent"] == 4
+            fresh = post(url, "/api/v1/checkpoint/restore", {"checkpoint_id": point["checkpoint_id"],
+                         "manifest_sha256": point["manifest_sha256"], "run_id": "next",
+                         "admin_secret": receiver.state.judge.admin_secret})["token"]
+            history = requests.get(url + "/api/v1/history", params={"token": fresh}, timeout=10).json()
+            assert history["agent_submissions"] == 3 and history["best_score"] == 9
+            assert history["entries"][1]["valid"] is False
+            accepted, result = grade(url, fresh, 10)
+            assert accepted["round_id"] == "agent-4" and result["report"]["score"] == 10
+            assert requests.post(url + "/api/v1/submit", data={"token": fresh},
+                                 files={"archive": ("candidate.tar.gz", candidate(11))}, timeout=20).status_code == 429
+            assert hashlib.sha256(prefix_path.read_bytes()).hexdigest() == prefix_digest
+    finally:
+        docker_client.images.remove(image_tag)

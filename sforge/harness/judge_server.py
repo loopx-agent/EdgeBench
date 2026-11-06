@@ -342,6 +342,10 @@ class JudgeState:
 
     def _publish_session(self, info: dict, prepared_backend: ContainerBackend | None, token: str) -> str:
         """Called under the native registration and token locks after preparation."""
+        if self._checkpoint_enabled:
+            if prepared_backend is not None:
+                raise ValueError("Durable native registration requires the configured Docker backend")
+            self._checkpoint_tail.register(info)
         run_key = self._run_key(info["run_id"], info["task_id"])
         self.run_resource_limits[run_key] = {
             "judge_cpu_limit": info["judge_cpu_limit"], "judge_mem_limit": info["judge_mem_limit"],
@@ -448,6 +452,9 @@ class JudgeState:
             if info is None:
                 raise KeyError("Invalid token")
 
+            if self._checkpoint_enabled:
+                info = dict(info)
+
             if kind == "agent":
                 max_subs = info.get("max_agent_submissions")
                 cooldown = info.get("submission_cooldown")
@@ -472,6 +479,9 @@ class JudgeState:
             n = info.get(counter_key, 1)
             round_id = f"{kind}-{n}"
             info[counter_key] = n + 1
+            if self._checkpoint_enabled:
+                self._checkpoint_tail.reserve(info)
+                self.tokens[token].update(info)
 
             remaining = None
             if kind == "agent":
@@ -484,6 +494,9 @@ class JudgeState:
     def _record_submission(self, run_id: str, submission_id: str, task_id: str, round_id: str | None, report_dict: dict | None, error: str | None, status: str = "completed") -> None:
         entry = submission_history_entry(submission_id, task_id, round_id, report_dict, error, status)
         history_key = f"{run_id}/{task_id}"
+        if self._checkpoint_enabled and status in ("completed", "error"):
+            info = self._checkpoint_tail.info(run_id, task_id)
+            self._checkpoint_tail.release(info, entry, report_dict, error, status)
         with self._history_lock:
             entries = self.run_history.setdefault(history_key, [])
             for i, e in enumerate(entries):
@@ -533,6 +546,10 @@ class JudgeState:
             raise ValueError(f"Unknown task: {task_id}")
 
         submission_id = uuid.uuid4().hex[:12]
+        if self._checkpoint_enabled:
+            with self._registration_lock, self._tokens_lock:
+                info = self._checkpoint_tail.info(run_id, task_id)
+                self._checkpoint_tail.accept(info, submission_id, round, archive)
         log_run_id = run_id or submission_id
         self.submissions[submission_id] = {
             "status": SubmissionStatus.QUEUED,
@@ -592,6 +609,11 @@ class JudgeState:
                 self._record_submission(log_run_id, submission_id, task_id, round, None, str(e), status=SubmissionStatus.ERROR)
 
     def get_result(self, submission_id: str) -> dict | None:
+        if self._checkpoint_enabled:
+            # A released result is visible only after its durable publication.
+            with self._registration_lock:
+                value = self.submissions.get(submission_id)
+                return dict(value) if value is not None else None
         return self.submissions.get(submission_id)
 
     # --- Game session management ---
