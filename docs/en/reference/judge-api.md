@@ -306,7 +306,7 @@ GET /api/v1/result/{submission_id}?token={host_session_token}
   "submission_id": "a1b2c3d4e5f6",
   "status": "error",
   "report": null,
-  "error": "Container exited with code 137 (OOM killed)"
+  "error": "judge_execution_failed:execute_evaluation"
 }
 ```
 
@@ -318,6 +318,29 @@ GET /api/v1/result/{submission_id}?token={host_session_token}
 | `running` | Judge container is running tests |
 | `completed` | Grading finished, report is available |
 | `error` | Grading failed (container crash, timeout, etc.) |
+
+### Terminal resource observations
+
+After evaluation, Docker can attach an optional `report.resource_diagnostics`:
+
+```json
+{"memory_oom_observed": true, "memory_limit_bytes": 134217728, "container_running": true}
+```
+
+This is a bounded, best-effort observation before cleanup, covering the container's
+lifetime. An OOM event may have killed a child while the evaluator recovered and
+produced a valid score. It does **not** identify the failing process, prove the
+cause of a timeout, or change score, validity, timeout, submission count or cooldown.
+`memory_limit_bytes: 0` means Docker reports no hard memory limit; `null` means
+unknown. A missing diagnostic means no OOM evidence was returned, not proof that
+memory was sufficient. Other backends currently omit it. No raw container metadata,
+environment, task-private output or host paths are exposed.
+
+`sforge-submit --result ID --details` displays this observation; JSON results retain
+the structured fields, including through checkpoint restoration. An evaluation
+exception retains its original error status and appends the same safe observation
+to the error text when available. No extra evaluation, retry, automatic early stop,
+pending-status polling or memory-limit adjustment is performed.
 
 ### Agent Feedback Relay
 
