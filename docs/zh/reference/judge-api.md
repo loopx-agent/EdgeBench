@@ -261,7 +261,7 @@ GET /api/v1/result/{submission_id}?token={host_session_token}
   "submission_id": "a1b2c3d4e5f6",
   "status": "error",
   "report": null,
-  "error": "Container exited with code 137 (OOM killed)"
+  "error": "judge_execution_failed:execute_evaluation"
 }
 ```
 
@@ -273,6 +273,24 @@ GET /api/v1/result/{submission_id}?token={host_session_token}
 | `running` | Judge 容器正在运行测试 |
 | `completed` | 评测完成，报告可用 |
 | `error` | 评测失败（容器崩溃、超时等） |
+
+### 终态资源观测
+
+Docker 可在评测结束后的 `report.resource_diagnostics` 中附带可选资源观测：
+
+```json
+{"memory_oom_observed": true, "memory_limit_bytes": 134217728, "container_running": true}
+```
+
+这是清理容器前的一次有界、尽力而为的观测，覆盖容器整个生命周期。OOM 可能只杀死
+某个子进程，而评测器仍能恢复并输出有效分数；它不定位具体进程，不证明超时由内存
+导致，也不改变分数、有效性、超时、提交次数或冷却。内存上限为 `0` 表示 Docker
+报告未设置硬上限，`null` 表示未知。缺少诊断不等于内存充足；其他后端目前不返回该字段。
+反馈不包含原始容器元数据、环境变量、题目私有输出或宿主路径。
+
+`sforge-submit --result ID --details` 展示该观测；JSON 结果与 checkpoint 恢复保留
+结构化字段。评测异常仍保持原错误状态，若取得观测则将同样的安全说明附在错误文本中。
+不会额外评测、重试、自动早停、轮询 pending 状态或调整内存上限。
 
 ### Agent 反馈 Relay
 

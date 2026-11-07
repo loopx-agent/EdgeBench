@@ -25,6 +25,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from sforge.harness.backend import ContainerBackend
+from sforge.harness.backend.base import ContainerResourceObservation
 from sforge.harness.config import (
     SForgeConfig,
     get_container_env,
@@ -46,6 +47,20 @@ class EvaluationError(Exception):
         super().__init__(message)
         self.task_id = task_id
         self.log_file = getattr(logger, "log_file", None)
+
+
+def _resource_observation(backend, handle, logger) -> ContainerResourceObservation | None:
+    """Best-effort terminal diagnostics must never change grading or cleanup."""
+    observe = getattr(backend, "resource_observation", None)
+    if handle is None or not callable(observe):
+        return None
+    try:
+        value = observe(handle)
+        return value if isinstance(value, ContainerResourceObservation) else None
+    except Exception as exc:
+        # Do not expose provider errors, which may include daemon URLs or auth.
+        logger.warning("Resource observation unavailable (%s)", type(exc).__name__)
+        return None
 
 
 def _filter_archive_files(
@@ -155,6 +170,8 @@ def judge_submission(
     )
 
     handle = None
+    resources = None
+    resources_observed = False
     stage = "prepare_image"
     try:
         # 1. Ensure judge image exists (Docker builds locally; K8s requires pre-built images in CR)
@@ -260,6 +277,8 @@ def judge_submission(
             handle, "/bin/bash /tmp/eval.sh", timeout, workdir=task_spec.cwd
         )
         test_output, timed_out, runtime = result.output, result.timed_out, result.elapsed_seconds
+        resources = _resource_observation(backend, handle, logger)
+        resources_observed = True
 
         # Save test output
         (log_dir / "test_output.txt").write_text(test_output)
@@ -271,6 +290,7 @@ def judge_submission(
             task_spec, test_output, submission_id, timed_out, runtime
         )
         report.submitted_at = submitted_at
+        report.resource_diagnostics = resources
         report.score_0_100 = rescale_score(task_spec.judge.rescale, report.score)
         stage = "record_report"
         (log_dir / "report.json").write_text(
@@ -288,8 +308,11 @@ def judge_submission(
         # existing ERROR transition retain the request identity instead. Raw
         # backend details stay in the private log, not solver-visible history.
         logger.exception("Judge execution failed during %s", stage)
+        if not resources_observed:
+            resources = _resource_observation(backend, handle, logger)
+        diagnostic = f"; {resources.summary()}" if resources is not None else ""
         raise EvaluationError(
-            task_spec.task_id, f"judge_execution_failed:{stage}", logger,
+            task_spec.task_id, f"judge_execution_failed:{stage}{diagnostic}", logger,
         ) from e
     finally:
         try:

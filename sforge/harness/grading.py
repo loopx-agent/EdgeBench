@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from sforge.harness.backend.base import ContainerResourceObservation
+
 from sforge.harness.constants import (
     START_TEST_OUTPUT,
     END_TEST_OUTPUT,
@@ -62,10 +64,13 @@ class EvalReport:
     details: list[EvalDetail] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     submitted_at: float = 0.0
+    resource_diagnostics: ContainerResourceObservation | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d.pop("raw_output", None)
+        if self.resource_diagnostics is None:
+            d.pop("resource_diagnostics")
         if d.get("summary") and len(d["summary"]) > SUMMARY_MAX_LEN:
             d["summary"] = d["summary"][:SUMMARY_MAX_LEN]
         return d

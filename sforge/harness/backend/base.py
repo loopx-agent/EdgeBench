@@ -48,6 +48,23 @@ class StreamingExecResult:
 
 
 @dataclass(frozen=True)
+class ContainerResourceObservation:
+    """Container-lifetime evidence, not attribution to an evaluation process."""
+
+    memory_oom_observed: bool
+    memory_limit_bytes: int | None = None
+    container_running: bool | None = None
+
+    def summary(self) -> str:
+        return (
+            f"Container memory OOM observed={self.memory_oom_observed}; "
+            f"memory_limit_bytes={self.memory_limit_bytes}; "
+            f"container_running={self.container_running}. "
+            "This observation does not determine the evaluation result."
+        )
+
+
+@dataclass(frozen=True)
 class ServiceEndpoint:
     """A routable service URL and provider gateway credentials."""
 
@@ -83,6 +100,12 @@ class ContainerBackend(abc.ABC):
         ...
 
     # --- Lifecycle ---
+
+    def resource_observation(
+        self, handle: ContainerHandle,
+    ) -> ContainerResourceObservation | None:
+        """Optional, bounded resource observation before container cleanup."""
+        return None
 
     @abc.abstractmethod
     def create_container(

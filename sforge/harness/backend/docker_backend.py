@@ -38,6 +38,7 @@ from docker.models.containers import Container
 from sforge.harness.backend.base import (
     ContainerBackend,
     ContainerHandle,
+    ContainerResourceObservation,
     ExecResult,
     NetworkIsolationStrategy,
     StreamingExecResult,
@@ -270,7 +271,9 @@ class DockerBackend(ContainerBackend):
         )
         api._raise_for_status(response)
 
-    def _inspect_container_for_cleanup(self, container: Container) -> dict:
+    def _inspect_container_for_cleanup(
+        self, container: Container, *, timeout: float = DOCKER_CLEANUP_REQUEST_TIMEOUT,
+    ) -> dict:
         """Inspect without inheriting the task-scale Docker client timeout."""
         api = getattr(self._client, "api", None)
         if not all(callable(getattr(api, name, None)) for name in
@@ -278,9 +281,31 @@ class DockerBackend(ContainerBackend):
             return self._client.api.inspect_container(container.id)
         response = api._get(
             api._url("/containers/{0}/json", container.id),
-            timeout=DOCKER_CLEANUP_REQUEST_TIMEOUT,
+            timeout=timeout,
         )
         return api._result(response, True)
+
+    def resource_observation(
+        self, handle: ContainerHandle,
+    ) -> ContainerResourceObservation | None:
+        # Diagnostic reads must not inherit an hour-long evaluation timeout or
+        # retry a daemon that is unavailable. Never inspect environment, logs,
+        # processes or task-private files for public feedback.
+        api = getattr(self._client, "api", None)
+        if not all(callable(getattr(api, name, None)) for name in
+                   ("_url", "_get", "_result")):
+            return None
+        attrs = self._inspect_container_for_cleanup(self._raw(handle), timeout=2.0)
+        state = attrs.get("State", {})
+        if state.get("OOMKilled") is not True:
+            return None
+        limit = attrs.get("HostConfig", {}).get("Memory")
+        running = state.get("Running")
+        return ContainerResourceObservation(
+            memory_oom_observed=True,
+            memory_limit_bytes=limit if type(limit) is int and limit >= 0 else None,
+            container_running=running if type(running) is bool else None,
+        )
 
     def create_container(
         self,

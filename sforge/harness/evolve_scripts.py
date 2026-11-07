@@ -453,6 +453,12 @@ else
 fi
 # Show full details if --details flag
 if [ "$DETAILS_MODE" -eq 1 ]; then
+    if echo "$REPORT" | jq -e '.resource_diagnostics.memory_oom_observed == true' >/dev/null; then
+        echo ""
+        echo "  Resource observation (container lifetime):"
+        echo "$REPORT" | jq -r '.resource_diagnostics | "    Memory OOM observed; memory limit (bytes): \(.memory_limit_bytes); container running: \(.container_running)"'
+        echo "    This observation does not determine the evaluation result."
+    fi
     HAS_DETAILS=$(echo "$REPORT" | jq -r '.details | length')
     if [ "$HAS_DETAILS" -gt 0 ] 2>/dev/null; then
         echo ""
