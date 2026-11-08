@@ -48,6 +48,8 @@ def generate_submit_script() -> str:
       --result ID     poll a submission from this run's history (no new submission)
       --no-wait       return after acceptance, or read --result once without polling
       --json          emit the native response and optional source receipt as JSON
+      --retain-archive DIR
+                      keep the exact uploaded archive in a private subdirectory of DIR
     """
     return _generate_submit_script()
 
@@ -62,6 +64,7 @@ RESULT_MODE=0
 DETAILS_MODE=0
 NO_WAIT=0
 JSON_MODE=0
+RETAIN_DIR=""
 SUBMISSION_ID=""
 while [ "$#" -gt 0 ]; do
     arg="$1"
@@ -71,6 +74,14 @@ while [ "$#" -gt 0 ]; do
         --details|-d) DETAILS_MODE=1 ;;
         --no-wait) NO_WAIT=1 ;;
         --json) JSON_MODE=1 ;;
+        --retain-archive)
+            if [ "$#" -eq 0 ] || [ -z "$1" ] || [ -n "$RETAIN_DIR" ]; then
+                echo "ERROR: --retain-archive requires one existing directory" >&2
+                exit 1
+            fi
+            RETAIN_DIR="$1"
+            shift
+            ;;
         --result)
             if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 echo "ERROR: --result requires a submission ID" >&2
@@ -95,6 +106,8 @@ while [ "$#" -gt 0 ]; do
             echo "  --no-wait       Submit a snapshot and return its ID without waiting for grading"
             echo "                  With --result ID: query once; return pending or the final feedback"
             echo "  --json          Emit one native JSON response; progress and errors use stderr"
+            echo "  --retain-archive DIR"
+            echo "                   Keep the exact uploaded archive outside the work tree"
             echo "  -h, --help      Show this help message"
             exit 0
             ;;
@@ -124,6 +137,11 @@ if [ "$NO_WAIT" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || { [ "$DETAILS_MODE" -eq 1
     exit 1
 fi
 
+if [ -n "$RETAIN_DIR" ] && { [ "$LIST_MODE" -eq 1 ] || [ "$RESULT_MODE" -eq 1 ]; }; then
+    echo "ERROR: --retain-archive requires a new submission" >&2
+    exit 1
+fi
+
 exec 3>&1
 if [ "$JSON_MODE" -eq 1 ]; then
     exec 1>&2
@@ -131,7 +149,8 @@ fi
 
 umask 077
 REQUEST_TMP=$(mktemp -d)
-trap 'rm -rf "$REQUEST_TMP"' EXIT
+RETAIN_PENDING=""
+trap 'rm -rf -- "$REQUEST_TMP"; if [ -n "$RETAIN_PENDING" ]; then rm -rf -- "$RETAIN_PENDING"; fi' EXIT
 
 get_json() {
     local code
@@ -231,6 +250,19 @@ if [ -n "$SUBMISSION_ID" ]; then
 else
 # ── Archive ──
 
+if [ -n "$RETAIN_DIR" ]; then
+    if ! RETAIN_DIR=$(cd -P -- "$RETAIN_DIR" && pwd -P); then
+        echo "ERROR: Archive retention directory is unavailable" >&2
+        exit 1
+    fi
+    PATCH_ROOT=$(cd -P -- "$PATCH_DIR" && pwd -P)
+    case "$RETAIN_DIR/" in
+        "${PATCH_ROOT%/}/"*)
+            echo "ERROR: Archive retention directory must be outside the work tree" >&2
+            exit 1
+            ;;
+    esac
+fi
 cd "$PATCH_DIR"
 ARCHIVE_FILE="$REQUEST_TMP/submission.tar.gz"
 TAR_PATHS="${SFORGE_SUBMIT_PATHS:-.}"
@@ -241,10 +273,29 @@ if [ -n "${SFORGE_SUBMIT_PATHS:-}" ]; then
     done
     TAR_PATHS="${EXISTING_PATHS# }"
 fi
+if [ -n "$RETAIN_DIR" ]; then
+    for submitted in $TAR_PATHS; do
+        [ -d "$submitted" ] || continue
+        SUBMITTED_ROOT=$(cd -P -- "$submitted" && pwd -P)
+        case "$RETAIN_DIR/" in
+            "${SUBMITTED_ROOT%/}/"*)
+                echo "ERROR: Archive retention directory overlaps a submitted path" >&2
+                exit 1
+                ;;
+        esac
+    done
+    RETAIN_PENDING=$(mktemp -d "$RETAIN_DIR/submission.XXXXXXXX")
+    ARCHIVE_FILE="$RETAIN_PENDING/submission.tar.gz"
+fi
 if [ -z "$TAR_PATHS" ]; then
     tar czf "$ARCHIVE_FILE" --files-from /dev/null
 else
     tar czf "$ARCHIVE_FILE" --exclude='.git' ${SFORGE_SUBMIT_EXCLUDE_FLAGS:-} $TAR_PATHS
+fi
+if [ -n "$RETAIN_DIR" ]; then
+    # Keep the original request bytes even if the acknowledgement is lost.
+    RETAIN_PENDING=""
+    printf 'Saved submission archive: %s\n' "$ARCHIVE_FILE" >&2
 fi
 ARCHIVE_SIZE=$(wc -c < "$ARCHIVE_FILE")
 

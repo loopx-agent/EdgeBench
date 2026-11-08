@@ -46,6 +46,12 @@ Common commands:
 | `sforge-submit --no-wait` | Submit a snapshot and return its accepted ID |
 | `sforge-submit --result ID --details` | Wait for an existing submission's feedback without resubmitting |
 | `sforge-submit --result ID --no-wait --details` | Query once; return pending or terminal feedback |
+| `sforge-submit --retain-archive DIR` | Submit and keep the exact uploaded archive in a private subdirectory of an existing `DIR` |
+
+Use a directory outside the work tree and all submitted paths. The client
+prints the archive path to stderr before uploading. After a lost response,
+look up the accepted submission and compare its JSON source receipt to the
+saved archive. The option uses the existing submission budget and cooldown.
 | `sforge-submit --list` / `-l` | List previous submissions |
 
 After asynchronous submission, continue independent work before checking the
