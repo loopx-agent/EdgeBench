@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import logging
 import os
@@ -381,6 +382,7 @@ def _exec_run(
 
         def read_stream():
             stream = None
+            exhausted = False
             try:
                 stream = container.client.api.exec_start(exec_id, stream=True)
                 for chunk in stream:
@@ -396,12 +398,19 @@ def _exec_run(
                             on_chunk(chunk)
                         except Exception:
                             pass  # Existing callback contract is best-effort.
+                exhausted = True
             except BaseException as exc:  # noqa: BLE001 -- propagate worker failures to the caller
                 errors.append(exc)
             finally:
                 if stream is not None:
                     try:
                         stream.close()
+                    except OSError as exc:
+                        # Docker SDK may shutdown an already disconnected socket
+                        # after normal EOF. Completion still needs the existing
+                        # exec terminal state and matching supervisor receipt.
+                        if not (exhausted and exc.errno == errno.ENOTCONN):
+                            errors.append(exc)
                     except BaseException as exc:  # noqa: BLE001 -- propagate worker failures to the caller
                         errors.append(exc)
                 # Only the writer closes the log. A failed stop must not leave
