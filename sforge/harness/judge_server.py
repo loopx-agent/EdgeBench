@@ -1288,7 +1288,7 @@ class JudgeState:
             entry for entry in full.get("entries", [])
             if (entry.get("round") or "").startswith("agent-")
         ]
-        evaluator = self._registered_evaluators.get(info["registration_id"])
+        evaluator = self._registered_evaluators.get(info.get("registration_id"))
         task_spec = evaluator.task if evaluator is not None else self.tasks.get(info["task_id"])
         policy = task_spec.judge.selection if task_spec else "pass_rate_first"
         direction = task_spec.judge.score_direction if task_spec else "maximize"
@@ -1402,7 +1402,7 @@ class JudgeState:
                 task_id, spool, run_id, round_id, cpu, mem,
                 hashlib.sha256(archive).hexdigest(), len(archive), kind=kind,
                 evaluation_context=session.get("evaluation_context"),
-                evaluator=self._registered_evaluators.get(session["registration_id"]),
+                evaluator=self._registered_evaluators.get(session.get("registration_id")),
             )
             return submission_id, round_id, remaining
 
