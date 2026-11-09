@@ -186,11 +186,20 @@ def test_real_facts_client_and_two_run_isolation(setup, tmp_path, monkeypatch):
 
         assert cli("--context", "--json") == context
         assert get(relay + "/history")["agent_submissions"] == 0
-        accepted = cli("--no-wait", "--json")
+        retained = tmp_path / "retained-uploads"
+        retained.mkdir()
+        accepted = cli("--no-wait", "--json", "--retain-archive", str(retained))
         sid = accepted["submission_id"]
         read = result(relay, sid)
         assert cli("--result", sid, "--no-wait", "--json") == read
         assert read["report"]["score"] == 10  # submitted 7 + actual image data 3
+        saved = list(retained.glob("*/submission.tar.gz"))
+        assert len(saved) == 1
+        uploaded = saved[0].read_bytes()
+        assert hashlib.sha256(uploaded).hexdigest() == read["receipt"]["archive_sha256"]
+        assert len(uploaded) == read["receipt"]["archive_bytes"]
+        native_archive = config.log_dir / "runs/run-a/fixture/submissions/agent-1/submission.tar.gz"
+        assert native_archive.read_bytes() == uploaded
         assert accepted["receipt"]["evaluation_context"] == context
         assert read["receipt"]["evaluation_context"] == context
         raw = get(relay + "/result/" + sid)

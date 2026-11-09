@@ -49,6 +49,7 @@ def generate_submit_script() -> str:
       --result ID     poll a submission from this run's history (no new submission)
       --no-wait       return after acceptance, or read --result once without polling
       --json          emit the native response and optional source receipt as JSON
+      --retain-archive DIR  save the exact uploaded archive in an external directory
     """
     return _generate_submit_script()
 
@@ -65,6 +66,7 @@ DETAILS_MODE=0
 NO_WAIT=0
 JSON_MODE=0
 SUBMISSION_ID=""
+RETAIN_DIR=""
 while [ "$#" -gt 0 ]; do
     arg="$1"
     shift
@@ -74,6 +76,20 @@ while [ "$#" -gt 0 ]; do
         --details|-d) DETAILS_MODE=1 ;;
         --no-wait) NO_WAIT=1 ;;
         --json) JSON_MODE=1 ;;
+        --retain-archive)
+            if [ -n "$RETAIN_DIR" ]; then
+                echo "ERROR: --retain-archive can be specified only once" >&2
+                exit 1
+            fi
+            case "${1:-}" in
+                ""|-*)
+                    echo "ERROR: --retain-archive requires an existing directory" >&2
+                    exit 1
+                    ;;
+            esac
+            RETAIN_DIR="$1"
+            shift
+            ;;
         --result)
             if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 echo "ERROR: --result requires a submission ID" >&2
@@ -99,6 +115,9 @@ while [ "$#" -gt 0 ]; do
             echo "  --no-wait       Submit a snapshot and return its ID without waiting for grading"
             echo "                  With --result ID: query once; return pending or the final feedback"
             echo "  --json          Emit one native JSON response; progress and errors use stderr"
+            echo "  --retain-archive DIR"
+            echo "                  Save the exact attempted upload in an existing directory outside submitted paths"
+            echo "                  The saved archive alone does not confirm acceptance"
             echo "  -h, --help      Show this help message"
             exit 0
             ;;
@@ -130,6 +149,16 @@ fi
 if [ "$NO_WAIT" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || { [ "$DETAILS_MODE" -eq 1 ] && [ "$RESULT_MODE" -eq 0 ]; }; }; then
     echo "ERROR: --no-wait cannot be combined with --list or with --details without --result ID" >&2
     exit 1
+fi
+if [ -n "$RETAIN_DIR" ]; then
+    if [ "$LIST_MODE" -eq 1 ] || [ "$RESULT_MODE" -eq 1 ] || [ "$CONTEXT_MODE" -eq 1 ]; then
+        echo "ERROR: --retain-archive requires a new submission" >&2
+        exit 1
+    fi
+    if ! RETAIN_DIR=$(CDPATH= cd -P -- "$RETAIN_DIR" && pwd -P); then
+        echo "ERROR: --retain-archive directory is not accessible" >&2
+        exit 1
+    fi
 fi
 
 exec 3>&1
@@ -255,12 +284,42 @@ if [ -n "${SFORGE_SUBMIT_PATHS:-}" ]; then
     done
     TAR_PATHS="${EXISTING_PATHS# }"
 fi
+if [ -n "$RETAIN_DIR" ]; then
+    PATCH_ROOT=$(pwd -P)
+    case "$RETAIN_DIR/" in
+        "${PATCH_ROOT%/}/"*)
+            echo "ERROR: --retain-archive directory must be outside the patch directory" >&2
+            exit 1
+            ;;
+    esac
+    for p in $TAR_PATHS; do
+        [ -d "$p" ] || continue
+        SOURCE_ROOT=$(CDPATH= cd -P -- "$p" && pwd -P)
+        case "$RETAIN_DIR/" in
+            "${SOURCE_ROOT%/}/"*)
+                echo "ERROR: --retain-archive directory overlaps a submitted directory" >&2
+                exit 1
+                ;;
+        esac
+    done
+fi
 if [ -z "$TAR_PATHS" ]; then
     tar czf "$ARCHIVE_FILE" --files-from /dev/null
 else
     tar czf "$ARCHIVE_FILE" --exclude='.git' ${SFORGE_SUBMIT_EXCLUDE_FLAGS:-} $TAR_PATHS
 fi
 ARCHIVE_SIZE=$(wc -c < "$ARCHIVE_FILE")
+if [ -n "$RETAIN_DIR" ]; then
+    SAVED_DIR=$(mktemp -d "$RETAIN_DIR/submission.XXXXXXXX")
+    SAVED_ARCHIVE="$SAVED_DIR/submission.tar.gz"
+    if ! cp "$ARCHIVE_FILE" "$SAVED_ARCHIVE.tmp" || ! mv "$SAVED_ARCHIVE.tmp" "$SAVED_ARCHIVE"; then
+        rm -f "$SAVED_ARCHIVE.tmp"
+        rmdir "$SAVED_DIR"
+        echo "ERROR: Could not retain the archive; no evaluation was submitted" >&2
+        exit 1
+    fi
+    printf '  Retained attempted upload: %s\n' "$SAVED_ARCHIVE" >&2
+fi
 
 echo ""
 echo "========================================"

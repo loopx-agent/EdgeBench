@@ -235,6 +235,12 @@ the human display cache. Omit `--json` for the existing text/cache behavior.
 `--list --json` returns only the current relay's visible history/availability
 snapshot.
 
+Add `--retain-archive DIR` only for a new submission to keep the exact attempted
+upload in an existing directory outside the patch/submitted directories. Match
+its bytes/digest with the native receipt to establish acceptance; a saved file
+alone does not establish acceptance. Context, history and result reads cannot
+use this flag and never create an archive.
+
 The client requests `include_receipt=true` as a submit form field or result
 query parameter through the opaque, run-scoped feedback relay. The work
 container receives neither the judge URL nor a judge token. Direct host API

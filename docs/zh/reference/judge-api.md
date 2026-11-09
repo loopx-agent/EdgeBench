@@ -196,6 +196,10 @@ stderr。加 `--no-wait` 时只返回已受理提交，不读取评分；
 退出码非零。JSON 模式不读取或更新供人查看的本地缓存；省略 `--json` 保持
 原有文本及缓存行为。`--list --json` 仅返回当前 relay 可见的历史和准入快照。
 
+新提交可加 `--retain-archive DIR`，在 patch/提交目录以外的既有目录保留实际尝试
+上传的同一归档。须用原生回执核对其字节/摘要才能证明受理，文件保存本身不证明
+已经受理。context、history 与 result 只读操作不能使用该参数，也不会创建归档。
+
 客户端在 submit 表单或 result 查询中传入 `include_receipt=true`。result
 回执通过不透明、绑定 run 的反馈 relay 查询，work 容器既拿不到 judge URL，也
 拿不到 judge token；直接调用宿主 API 查询回执时仍需 session token。两条链路
