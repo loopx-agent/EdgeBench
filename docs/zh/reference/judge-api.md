@@ -51,7 +51,8 @@ Content-Type: application/json
 
 {
   "task_id": "ad_placement_optimization",
-  "run_id": "run-001"
+  "run_id": "run-001",
+  "admin_secret": "CURRENT_CONTROLLER_SECRET"
 }
 ```
 
@@ -60,7 +61,14 @@ Content-Type: application/json
 ```json
 {
   "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-  "feedback_relay_id": "11223344556677889900aabbccddeeff"
+  "feedback_relay_id": "11223344556677889900aabbccddeeff",
+  "evaluation_context": {
+    "schema_version": "sforge_run_evaluation_context_v1",
+    "task_id": "ad_placement_optimization",
+    "run_id": "run-001",
+    "registration_id": "00000000000000000000000000000000",
+    "evaluation_conditions": null
+  }
 }
 ```
 
@@ -211,8 +219,56 @@ stderr。加 `--no-wait` 时只返回已受理提交，不读取评分；
 冷却。checkpoint 捕获和恢复会保留每个回执，并重映射查询 ID。旧结果缺少来源
 时，归档字段明确为 null。旧服务器不支持回执时，无法提供 `--json` 来源回执；
 应使用原文本客户端恢复，不能因此重提。上面的摘要只是示例。归档摘要不等于
-源码树摘要、题目输入版本或评测器身份；比较仍须由 runner 独立验证这些条件。
+源码树摘要、题目输入版本或评测器身份；这些服务端事实使用下面的独立 envelope。
 回执匹配不证明实验可比、分数有效或候选最优。
+
+#### 服务端持有的评测条件
+
+`GET {SFORGE_FEEDBACK_URL}/context` 与 `sforge-submit --context --json` 只读
+当前注册的不可变 `evaluation_context`，不提交、不消耗轮次、不读取评分报告。
+注册响应也返回同一对象；上面的注册示例表示条件未知。服务能够确认全部受支持
+事实时，`evaluation_conditions` 包含：
+
+| 字段 | 服务实际观察到的来源 |
+|---|---|
+| `schema_version` | `sforge_evaluation_conditions_v1` |
+| `task_sha256` | loader 实际解析的 task JSON 原始字节 |
+| `benchmark_sha256` | loader 实际解析的 `BENCHMARK.yaml` 原始字节 |
+| `task_spec_sha256` | 生效的 `TaskSpec`，复用 checkpoint 原有规范编码 |
+| `native_source_sha256` | 运行中服务启动时按 checkpoint 算法捕获一次的原生 Python 源码摘要 |
+| `judge_image_id` | 注册时解析的真实 Docker image 内容 ID（`sha256:` 加 64 位十六进制） |
+| `execution_config_sha256` | 生效的 judge CPU/内存限制及注入环境，含默认 judge URL |
+| `score_direction` | 实际加载的 `maximize` 或 `minimize` 指标方向 |
+| `selection` | 实际加载的原生候选选择规则 |
+
+SHA-256 字段均为 64 位小写十六进制。执行配置摘要对键为 `judge_cpu_limit`、
+`judge_mem_limit`、`environment` 的紧凑、排序键 UTF-8 JSON 计算（保留非 ASCII
+字符）；资源依次取注册 override、服务配置、task 默认值。不会返回环境值或隐藏
+评测器/数据内容。task 与 benchmark 摘要来自同一次解析的字节，不在注册时重新
+读取磁盘盖新标签。注册冻结生效的 task、评分配置与 backend，受理的提交使用该
+快照及解析出的不可变 image ID，即使标签后来改变。部署源码归服务实例所有；
+源码变更应启动新的服务实例。
+
+开启回执的 submit/result 额外包含 `receipt.evaluation_context`，从受理时复制，
+不在读回时重建。调用方可在启动前只读一次 relay context，核对预期 run、task、
+task 字节及指标方向，保存服务 context；随后每个 result 只需**一次**带回执的 GET。
+必须使用服务实际 source/image/config 身份，本机 worker 的 checkout 标签不能代表
+另一个正在运行的 grader。条件缺失或漂移时机器归因保持未知，原生反馈仍可使用。
+旧服务可能对 `/context` 返回 404；旧结果的 `receipt.evaluation_context` 为 null。
+两种情况都不能从新 worker 回填版本。
+
+当前 game task、非 Docker backend、源码字节不可得、缺少 loader 来源、注册时
+image 尚未就绪，均返回 `evaluation_conditions: null`。资格读取不 build/pull
+image；之后开始评分也不会追认本次注册或旧分数的条件。准备 image 后使用新的
+registration/run。image 身份覆盖镜像内数据；评测命令获取的外部可变数据或服务
+不在本协议范围内。这些事实不证明评分完全封闭，也不证明实验所有预算和硬件一致。
+
+条件已知时，相同 live run/task、相同条件与注册限制的重复请求幂等返回原 token、
+relay、计数器和冷却，并发候选因此取得不同轮次及原生目录。冲突注册返回 **409**，
+要求新的 `run_id`，不能创建第二个 `agent-1` writer。条件未知的旧注册保留原行为，
+没有可归因保证。checkpoint 与终态 tail 保留每条结果的原 context，重映射查询 ID
+后仍保留原 run/registration 身份。历史缺失继续缺失，恢复不能把旧分数重标为目标
+服务的评测器；checkpoint 原有严格 source/evaluator 校验保持有效。
 
 ### 获取结果
 
@@ -295,11 +351,12 @@ Docker 可在评测结束后的 `report.resource_diagnostics` 中附带可选资
 ### Agent 反馈 Relay
 
 runner 在 work 容器内把 `SFORGE_FEEDBACK_URL` 设置为
-`/api/v1/feedback/{feedback_relay_id}`。生成的 `sforge-submit` 只调用三个无需
+`/api/v1/feedback/{feedback_relay_id}`。生成的 `sforge-submit` 调用以下无需
 Judge 凭据、且绑定当前注册的接口：
 
 ```http
 POST {SFORGE_FEEDBACK_URL}/submit
+GET  {SFORGE_FEEDBACK_URL}/context
 GET  {SFORGE_FEEDBACK_URL}/history
 GET  {SFORGE_FEEDBACK_URL}/result/{submission_id}
 ```

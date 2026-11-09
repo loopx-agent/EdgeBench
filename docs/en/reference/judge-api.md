@@ -51,7 +51,8 @@ Content-Type: application/json
 
 {
   "task_id": "ad_placement_optimization",
-  "run_id": "run-001"
+  "run_id": "run-001",
+  "admin_secret": "CURRENT_CONTROLLER_SECRET"
 }
 ```
 
@@ -60,7 +61,14 @@ Content-Type: application/json
 ```json
 {
   "token": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-  "feedback_relay_id": "11223344556677889900aabbccddeeff"
+  "feedback_relay_id": "11223344556677889900aabbccddeeff",
+  "evaluation_context": {
+    "schema_version": "sforge_run_evaluation_context_v1",
+    "task_id": "ad_placement_optimization",
+    "run_id": "run-001",
+    "registration_id": "00000000000000000000000000000000",
+    "evaluation_conditions": null
+  }
 }
 ```
 
@@ -255,9 +263,71 @@ receipt while remapping lookup IDs. Older retained results have explicit null
 archive fields. A server without receipt support cannot provide `--json`
 source receipts; recover with the existing text client instead of resubmitting.
 The example digest above is illustrative. An archive digest is not a source-tree
-digest, task-input revision or evaluator identity. Comparisons still need those
-independently verified conditions from their runner; a matching receipt is not
-proof of a comparable experiment, valid score or best candidate.
+digest, task-input revision or evaluator identity. Those service facts have a
+separate envelope below; matching receipts alone do not prove a comparable
+experiment, valid score or best candidate.
+
+#### Service-owned evaluation conditions
+
+`GET {SFORGE_FEEDBACK_URL}/context` and `sforge-submit --context --json` read the
+current registration's immutable `evaluation_context` without submitting,
+spending a round, or reading a grading report. Registration also returns this
+object. The example registration above shows unknown conditions. When the
+service can establish all supported facts, `evaluation_conditions` contains:
+
+| Field | Service-observed source |
+|---|---|
+| `schema_version` | `sforge_evaluation_conditions_v1` |
+| `task_sha256` | Exact task JSON bytes used by the task loader |
+| `benchmark_sha256` | Exact `BENCHMARK.yaml` bytes used by the loader |
+| `task_spec_sha256` | Effective `TaskSpec`, with the existing checkpoint canonical encoding |
+| `native_source_sha256` | Running service's native Python source, captured once at startup using the checkpoint digest algorithm |
+| `judge_image_id` | Actual Docker image content ID (`sha256:` plus 64 hex characters), resolved at registration |
+| `execution_config_sha256` | Effective judge CPU/memory limits and injected judge environment, including the default judge URL |
+| `score_direction` | Loaded `maximize` or `minimize` metric direction |
+| `selection` | Loaded native selection policy |
+
+SHA-256 fields are lowercase, 64-character hexadecimal digests. The execution
+config digest hashes compact, sorted-key UTF-8 JSON (non-ASCII characters are
+preserved) with keys `judge_cpu_limit`, `judge_mem_limit`, and `environment`;
+limits resolve registration override, service config, then task defaults.
+Environment values and hidden evaluator/data contents are never returned.
+The task and benchmark digests come from the same bytes that were parsed,
+not a later filesystem read. The registration freezes the effective task,
+grading config and backend; accepted submissions use that snapshot and the
+resolved immutable image ID even after its tag changes. Source files belong to
+the deployed service; deploy changed source in a new service instance.
+
+Every opt-in submit/result receipt additionally includes `evaluation_context`,
+copied from acceptance rather than reconstructed at read time. A consumer can
+qualify the relay once against its intended run, task, task bytes and direction,
+save the service context, then check each result with **one** receipt-enabled
+GET. Use the service's actual source/image/config identities; a worker's local
+checkout label does not identify a separately running grader. Missing or changed
+conditions leave machine attribution unknown; ordinary native feedback remains
+available. Older servers may return 404 for `/context`; older results have null
+`receipt.evaluation_context`. Never fill either case from a newer worker.
+
+Currently, game tasks, non-Docker backends, unavailable source bytes, missing
+loader provenance, and images not already available at registration produce
+`evaluation_conditions: null`. Qualification does not build/pull an image, and
+later grading does not retroactively label the registration or earlier scores.
+Use a fresh registration/run after preparing an image. Image identity covers
+data baked into that image; mutable data or services fetched by an evaluation
+command are outside this contract. These facts do not certify hermetic scoring
+or equality of all experimental budgets and hardware.
+
+For known conditions, repeating the same live run/task with identical conditions
+and registration limits returns the original token, relay, counters and cooldown.
+Concurrent candidates therefore receive distinct rounds and native directories.
+A conflicting registration returns **409** and requires a fresh `run_id`; it
+cannot create another `agent-1` writer. Legacy registrations with unknown
+conditions retain their previous behavior and provide no attribution guarantee.
+Checkpoint capsules and terminal tails preserve each result's original context,
+including its original run/registration identity after lookup-ID remapping.
+Historical missing contexts stay missing; restore never relabels old scores as
+the destination evaluator. Existing strict checkpoint source/evaluator checks
+remain in force.
 
 ### Get Result
 
@@ -350,6 +420,7 @@ The runner sets `SFORGE_FEEDBACK_URL` to
 
 ```http
 POST {SFORGE_FEEDBACK_URL}/submit
+GET  {SFORGE_FEEDBACK_URL}/context
 GET  {SFORGE_FEEDBACK_URL}/history
 GET  {SFORGE_FEEDBACK_URL}/result/{submission_id}
 ```
