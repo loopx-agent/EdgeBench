@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 import yaml
 
@@ -29,6 +31,8 @@ BENCHMARK_FILENAME = "BENCHMARK.yaml"
 class BenchmarkMeta:
     name: str
     base_images: dict[str, dict] = field(default_factory=dict)
+    # Load provenance is not part of the effective benchmark/task specification.
+    _source_sha256: ClassVar[str | None] = None
 
 
 def load_benchmark(tasks_dir: Path) -> BenchmarkMeta:
@@ -39,9 +43,11 @@ def load_benchmark(tasks_dir: Path) -> BenchmarkMeta:
             f"Benchmark metadata not found: {path}\n"
             f"Expected a {BENCHMARK_FILENAME} file in the tasks directory."
         )
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return BenchmarkMeta(
+    raw = path.read_bytes()
+    data = yaml.safe_load(raw)
+    benchmark = BenchmarkMeta(
         name=data["name"],
         base_images=data.get("base_images", {}),
     )
+    benchmark._source_sha256 = hashlib.sha256(raw).hexdigest()
+    return benchmark

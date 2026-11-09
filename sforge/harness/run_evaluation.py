@@ -133,6 +133,7 @@ def judge_submission(
     log_dir: Path | None = None,
     verbose: bool = False,
     submitted_at: float | None = None,
+    evaluator_image: str | None = None,
 ) -> EvalReport:
     """
     Grade an archive submission in an ephemeral judge container.
@@ -175,7 +176,7 @@ def judge_submission(
     stage = "prepare_image"
     try:
         # 1. Ensure judge image exists (Docker builds locally; K8s requires pre-built images in CR)
-        if backend.backend_name == "docker":
+        if backend.backend_name == "docker" and evaluator_image is None:
             from sforge.harness.backend.docker_backend import DockerBackend
             assert isinstance(backend, DockerBackend)
             build_judge_image(task_spec, config, backend.client, force_rebuild=False)
@@ -191,7 +192,7 @@ def judge_submission(
         mem = config.judge_mem_limit if config.judge_mem_limit is not None else task_spec.judge.mem_limit
         stage = "create_container"
         handle = backend.create_container(
-            task_spec.judge_image_key,
+            evaluator_image or task_spec.judge_image_key,
             container_name,
             environment=env,
             extra_hosts={"host.docker.internal": "host-gateway"},

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -53,6 +54,12 @@ from sforge.harness.config import (
 )
 from sforge.harness.constants import get_admin_secret
 from sforge.harness.docker_build import BuildImageError, build_judge_image
+from sforge.harness.evaluation_conditions import (
+    RegisteredEvaluator,
+    RunEvaluationContext,
+    capture_conditions,
+    native_source_sha256,
+)
 from sforge.harness.feedback_transport import FeedbackTransportRecorder
 from sforge.harness.run_evaluation import judge_submission
 from sforge.harness.selection import select_best
@@ -72,6 +79,10 @@ class SubmissionBudgetExceeded(Exception):
 
 
 class SubmissionCooldownActive(Exception):
+    pass
+
+
+class RegistrationConditionsDiffer(ValueError):
     pass
 
 
@@ -116,6 +127,7 @@ class SubmissionReceipt(BaseModel):
     round_id: str | None
     archive_sha256: str | None
     archive_bytes: int | None
+    evaluation_context: RunEvaluationContext | None = None
 
 
 class ResultResponse(BaseModel):
@@ -192,6 +204,7 @@ class RegisterRequest(BaseModel):
 class RegisterResponse(BaseModel):
     token: str
     feedback_relay_id: str
+    evaluation_context: RunEvaluationContext | None = None
 
 
 class SubmitResponse(BaseModel):
@@ -722,6 +735,7 @@ class JudgeState:
         self.admin_secret = get_admin_secret(config.log_dir)
         self.feedback_transport = FeedbackTransportRecorder(config.log_dir)
         self.tasks: dict[str, TaskSpec] = {}
+        self.native_source_sha256 = native_source_sha256()
         self.submissions: dict[str, dict] = {}  # submission_id -> {status, report, ...}
         self.game_sessions: dict[str, GameSessionState] = {}
         self.game_counters: dict[str, int] = {}
@@ -729,6 +743,8 @@ class JudgeState:
         self.tokens: dict[str, dict] = {}  # token -> {task_id, run_id, next_agent, next_auto, judge_cpu_limit, judge_mem_limit}
         self.run_resource_limits: dict[str, dict] = {}  # run/task -> limits
         self.run_backends: dict[str, ContainerBackend] = {}  # run/task -> backend
+        self._registered_evaluators: dict[str, RegisteredEvaluator] = {}
+        self._submission_evaluators: dict[str, RegisteredEvaluator] = {}
         self._capacity_reconcile_lock = threading.Lock()
         self._capacity_reconciled_at = 0.0
         self._judge_queue_drained = threading.Event()
@@ -913,7 +929,7 @@ class JudgeState:
                 from sforge.harness.checkpoint import RESTORE_MARKER
                 if (self.config.log_dir / "runs" / run_id / RESTORE_MARKER).exists():
                     raise ValueError("A restored run cannot be cold-registered again")
-            info, prepared_backend, token = self._prepare_session(task_id, run_id,
+            info, prepared_backend, token, evaluator = self._prepare_session(task_id, run_id,
                 judge_cpu_limit=judge_cpu_limit,
                 judge_mem_limit=judge_mem_limit,
                 backend=backend,
@@ -928,9 +944,31 @@ class JudgeState:
                 e2b_sandbox_ttl=e2b_sandbox_ttl,
             )
             with self._tokens_lock:
-                return self._publish_session(info, prepared_backend, token)
+                current = info["evaluation_context"]["evaluation_conditions"]
+                for previous_token, previous in self.tokens.items():
+                    if previous["run_id"] == run_id and previous["task_id"] == task_id:
+                        prior_context = previous.get("evaluation_context")
+                        prior = prior_context.get("evaluation_conditions") if prior_context else None
+                        if current is not None and prior == current and all(
+                            previous[key] == info[key]
+                            for key in ("judge_cpu_limit", "judge_mem_limit", "max_agent_submissions", "submission_cooldown")
+                        ):
+                            # Retry the existing registration, including its
+                            # consumed rounds/cooldown, instead of creating two
+                            # agent-1 writers into the same native directory.
+                            return previous_token
+                        # Native archives/logs and round counters share run/task
+                        # storage. A second live registration could race even
+                        # with identical evaluator conditions and swap archives.
+                        if prior is not None or current is not None:
+                            raise RegistrationConditionsDiffer(
+                                "Run/task already registered with evaluation conditions; "
+                                "reuse its registration or use a fresh run_id"
+                            )
+                return self._publish_session(info, prepared_backend, token, evaluator)
 
-    def _publish_session(self, info: dict, prepared_backend: ContainerBackend | None, token: str) -> str:
+    def _publish_session(self, info: dict, prepared_backend: ContainerBackend | None,
+                         token: str, evaluator: RegisteredEvaluator) -> str:
         """Called under the native registration and token locks after preparation."""
         if self._checkpoint_enabled:
             if prepared_backend is not None:
@@ -942,6 +980,8 @@ class JudgeState:
         }
         if prepared_backend is not None:
             self.run_backends[run_key] = prepared_backend
+        if info["evaluation_context"]["evaluation_conditions"] is not None:
+            self._registered_evaluators[info["registration_id"]] = evaluator
         self.tokens[token] = info
         return token
 
@@ -957,7 +997,7 @@ class JudgeState:
                          submission_cooldown: int | None = None,
                          e2b_template_map: dict[str, str] | None = None,
                          e2b_template_namespace: str | None = None,
-                         e2b_sandbox_ttl: int | None = None) -> tuple[dict, ContainerBackend | None, str]:
+                         e2b_sandbox_ttl: int | None = None) -> tuple[dict, ContainerBackend | None, str, RegisteredEvaluator]:
         if task_id not in self.tasks:
             raise ValueError(f"Unknown task: {task_id}")
         if self._run_lanes and run_id not in self._run_lanes:
@@ -1029,7 +1069,19 @@ class JudgeState:
                     e2b_template_namespace=effective_config.e2b_template_namespace,
                     e2b_sandbox_ttl=effective_config.e2b_sandbox_ttl,
                 )
-        return info, backend_override, secrets.token_hex(16)
+        evaluator = RegisteredEvaluator(
+            copy.deepcopy(self.tasks[task_id]), self._evaluation_config(info),
+            backend_override or self.backend,
+        )
+        info["evaluation_context"] = RunEvaluationContext(
+            task_id=task_id, run_id=run_id,
+            registration_id=info["registration_id"],
+            evaluation_conditions=capture_conditions(
+                evaluator.task, evaluator.backend,
+                self.native_source_sha256, evaluator.config,
+            ),
+        ).model_dump(mode="json")
+        return info, backend_override, secrets.token_hex(16), evaluator
 
     @staticmethod
     def _run_key(run_id: str, task_id: str) -> str:
@@ -1044,12 +1096,19 @@ class JudgeState:
                 return backend
         return self.backend
 
+    def _evaluation_config(self, info: dict) -> SForgeConfig:
+        config = copy.deepcopy(self.config)
+        for key in ("judge_cpu_limit", "judge_mem_limit"):
+            if info[key] is not None:
+                setattr(config, key, info[key])
+        return config
+
     def resolve_token(self, token: str) -> dict:
         with self._tokens_lock:
             info = self.tokens.get(token)
             if info is None:
                 raise KeyError("Invalid token")
-            return dict(info)
+            return copy.deepcopy(info)
 
     def resolve_feedback_relay(self, relay_id: str) -> tuple[str, dict]:
         """Resolve one opaque relay route to its host-held judge authority."""
@@ -1062,7 +1121,7 @@ class JudgeState:
             if len(matches) != 1:
                 raise KeyError("Invalid feedback relay")
             token, info = matches[0]
-            return token, dict(info)
+            return token, copy.deepcopy(info)
 
     def feedback_relay_id(self, token: str) -> str:
         info = self.resolve_token(token)
@@ -1229,7 +1288,8 @@ class JudgeState:
             entry for entry in full.get("entries", [])
             if (entry.get("round") or "").startswith("agent-")
         ]
-        task_spec = self.tasks.get(info["task_id"])
+        evaluator = self._registered_evaluators.get(info["registration_id"])
+        task_spec = evaluator.task if evaluator is not None else self.tasks.get(info["task_id"])
         policy = task_spec.judge.selection if task_spec else "pass_rate_first"
         direction = task_spec.judge.score_direction if task_spec else "maximize"
         best = select_best(agent_entries, direction, policy)
@@ -1341,6 +1401,8 @@ class JudgeState:
             submission_id = self._enqueue(
                 task_id, spool, run_id, round_id, cpu, mem,
                 hashlib.sha256(archive).hexdigest(), len(archive), kind=kind,
+                evaluation_context=session.get("evaluation_context"),
+                evaluator=self._registered_evaluators.get(session["registration_id"]),
             )
             return submission_id, round_id, remaining
 
@@ -1376,7 +1438,9 @@ class JudgeState:
     def _enqueue(self, task_id: str, spool: Path, run_id: str | None,
                  round_id: str | None, cpu: int | None, mem: str | None,
                  archive_sha256: str, archive_bytes: int,
-                 *, kind: str | None = None) -> str:
+                 *, kind: str | None = None,
+                 evaluation_context: dict | None = None,
+                 evaluator: RegisteredEvaluator | None = None) -> str:
         submission_id = uuid.uuid4().hex[:12]
         if self._checkpoint_enabled:
             try:
@@ -1399,7 +1463,10 @@ class JudgeState:
             "run_id": run_id, "round": round_id, "report": None, "error": None,
             "submitted_at": time.time(),
             "archive_sha256": archive_sha256, "archive_bytes": archive_bytes,
+            "evaluation_context": copy.deepcopy(evaluation_context),
         }
+        if evaluator is not None:
+            self._submission_evaluators[submission_id] = evaluator
         try:
             self._record_submission(run_id or submission_id, submission_id, task_id,
                                     round_id, None, None, status="queued")
@@ -1427,7 +1494,8 @@ class JudgeState:
                        run_id: str | None, round_id: str | None,
                        cpu: int | None, mem: str | None,
                        kind: str | None = None) -> None:
-        backend = self._get_backend(run_id, task_id)
+        evaluator = self._submission_evaluators.get(submission_id)
+        backend = evaluator.backend if evaluator is not None else self._get_backend(run_id, task_id)
         token = f"{os.getpid()}:{submission_id}"
         slot_acquired = memory_acquired = False
         owner_id = None
@@ -1438,9 +1506,10 @@ class JudgeState:
                     raise RuntimeError("Docker engine identity is required for host judge capacity")
                 memory_units = None
                 if self.host_memory_capacity is not None:
-                    memory_limit = (mem if mem is not None else self.config.judge_mem_limit)
+                    grade_config = evaluator.config if evaluator is not None else self.config
+                    memory_limit = (mem if mem is not None else grade_config.judge_mem_limit)
                     if memory_limit is None:
-                        memory_limit = self.tasks[task_id].judge.mem_limit
+                        memory_limit = (evaluator.task if evaluator is not None else self.tasks[task_id]).judge.mem_limit
                     memory_units = (parse_bytes(memory_limit) if memory_limit is not None
                                     else self.host_memory_capacity.capacity)
                     if memory_units < 1 or memory_units > self.host_memory_capacity.capacity:
@@ -1502,7 +1571,8 @@ class JudgeState:
         self._record_submission(run_id or submission_id, submission_id, task_id,
                                 round, None, None, status="running")
         try:
-            task_spec = self.tasks[task_id]
+            evaluator = self._submission_evaluators.get(submission_id)
+            task_spec = evaluator.task if evaluator is not None else self.tasks[task_id]
             log_run_id = run_id or submission_id
             sub_num = str(round) if round is not None else "1"
             sub_log_dir = (
@@ -1514,15 +1584,19 @@ class JudgeState:
                 overrides["judge_cpu_limit"] = judge_cpu_limit
             if judge_mem_limit is not None:
                 overrides["judge_mem_limit"] = judge_mem_limit
-            config = replace(self.config, **overrides) if overrides else self.config
+            base_config = evaluator.config if evaluator is not None else self.config
+            config = replace(base_config, **overrides) if overrides else base_config
+            context = self.submissions[submission_id].get("evaluation_context")
+            conditions = context.get("evaluation_conditions") if context else None
             report = judge_submission(
                 task_spec=task_spec,
                 archive=archive,
                 config=config,
-                backend=self._get_backend(run_id, task_id),
+                backend=evaluator.backend if evaluator is not None else self._get_backend(run_id, task_id),
                 submission_id=submission_id,
                 submitted_at=self.submissions[submission_id]["submitted_at"],
                 log_dir=sub_log_dir,
+                **({"evaluator_image": conditions["judge_image_id"]} if conditions else {}),
             )
             report_dict = report.to_dict()
             report_dict.pop("score_0_100", None)
@@ -1946,6 +2020,7 @@ def create_app(
             task_id=result["task_id"], round_id=result["round"],
             archive_sha256=result.get("archive_sha256"),
             archive_bytes=result.get("archive_bytes"),
+            evaluation_context=result.get("evaluation_context"),
         )
 
     def result_response(
@@ -2003,7 +2078,10 @@ def create_app(
             return RegisterResponse(
                 token=token,
                 feedback_relay_id=state.feedback_relay_id(token),
+                evaluation_context=state.resolve_token(token).get("evaluation_context"),
             )
+        except RegistrationConditionsDiffer as e:
+            raise HTTPException(status_code=409, detail=str(e))
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
@@ -2067,6 +2145,15 @@ def create_app(
 
     # Solver-facing capability relay. The opaque route selects exactly one
     # registration; no judge token or admin authority enters the work container.
+    @app.get("/api/v1/feedback/{relay_id}/context")
+    def feedback_context(relay_id: str) -> RunEvaluationContext | None:
+        """Read immutable registration facts without submitting or spending a round."""
+        try:
+            _, info = state.resolve_feedback_relay(relay_id)
+            return info.get("evaluation_context")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Feedback relay not found")
+
     @app.post("/api/v1/feedback/{relay_id}/submit")
     def feedback_submit(
         relay_id: str, archive: UploadFile = File(...),
@@ -2095,9 +2182,9 @@ def create_app(
                 "remaining_submissions": remaining,
             }
             if include_receipt:
-                payload["receipt"] = dict(
-                    submission_receipt(state.get_result(submission_id))
-                )
+                payload["receipt"] = submission_receipt(
+                    state.get_result(submission_id)
+                ).model_dump(mode="json")
             state.feedback_transport.response(
                 exchange_id=exchange_id,
                 run_id=run_id,
@@ -2251,7 +2338,7 @@ def create_app(
             "error": result["error"],
         })
         if include_receipt:
-            payload["receipt"] = dict(submission_receipt(result))
+            payload["receipt"] = submission_receipt(result).model_dump(mode="json")
         state.feedback_transport.response(
             exchange_id=exchange_id,
             run_id=run_id,

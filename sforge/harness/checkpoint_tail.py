@@ -135,7 +135,8 @@ class DurableRegistrations:
             results = {
                 entry["submission_id"]: {
                     key: self.state.submissions[entry["submission_id"]][key]
-                    for key in ("status", "report", "error")
+                    for key in ("status", "report", "error", "archive_sha256", "archive_bytes", "evaluation_context")
+                    if key in self.state.submissions[entry["submission_id"]]
                 }
                 for entry in history
             }
@@ -286,6 +287,7 @@ class DurableRegistrations:
             "status": "queued",
             "report": None,
             "error": None,
+            "evaluation_context": copy.deepcopy(info.get("evaluation_context")),
         }
         self._save(info, value)
 
@@ -299,7 +301,7 @@ class DurableRegistrations:
         value["history"] = [
             entry if e["submission_id"] == sid else e for e in value["history"]
         ]
-        value["results"][sid] = {"status": status, "report": report, "error": error}
+        value["results"][sid].update(status=status, report=report, error=error)
         self._save(info, value)
 
     def rollback(self, registration_id):
@@ -399,10 +401,12 @@ class DurableRegistrations:
                     "Sealed checkpoint history is not the durable prefix"
                 )
             for old, inherited in zip(prefix["history"], mapped):
-                if not _same_released_value(value["results"][inherited["submission_id"]], {
-                    k: prefix["results"][old["submission_id"]][k]
-                    for k in ("status", "report", "error")
-                }):
+                current = value["results"][inherited["submission_id"]]
+                sealed = prefix["results"][old["submission_id"]]
+                if not _same_released_value(
+                    {k: current.get(k) for k in ("status", "report", "error", "evaluation_context")},
+                    {k: sealed.get(k) for k in ("status", "report", "error", "evaluation_context")},
+                ):
                     raise CheckpointUnavailable("Sealed checkpoint result changed")
             next_agent = value["opportunity"]["next_agent"]
             if type(next_agent) is not int or [e["round"] for e in history] != [

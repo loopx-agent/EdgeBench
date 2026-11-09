@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import ClassVar
 
 from sforge.harness.benchmark import BenchmarkMeta
 from sforge.harness.constants import (
@@ -58,6 +59,20 @@ def _compute_base_image_hash(base_image_key: str, base_image_spec: dict) -> str:
     return hashlib.sha256(data.encode()).hexdigest()
 
 
+@dataclass(frozen=True)
+class TaskSourceRevision:
+    task_sha256: str
+    benchmark_sha256: str
+    task_spec_sha256: str
+
+
+def task_spec_sha256(task: TaskSpec) -> str:
+    """Preserve the native checkpoint's canonical effective-spec encoding."""
+    return hashlib.sha256(json.dumps(
+        asdict(task), sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
+
+
 @dataclass
 class TaskSpec:
     task_id: str
@@ -73,6 +88,8 @@ class TaskSpec:
     base_image_spec: dict | None = None
     game_mode: bool = False
     internet: bool = True
+    # ClassVar excludes provenance from asdict and existing image/checkpoint hashes.
+    _source_revision: ClassVar[TaskSourceRevision | None] = None
 
     @property
     def base_image_tag(self) -> str:
@@ -196,8 +213,8 @@ def _validate_image_tag_consistency(
 
 def make_task_spec(task_path: Path, benchmark: BenchmarkMeta) -> TaskSpec:
     """Load a TaskSpec from a task JSON file, resolving base image from benchmark metadata."""
-    with open(task_path) as f:
-        data: SForgeTask = json.load(f)
+    raw = task_path.read_bytes()
+    data: SForgeTask = json.loads(raw)
 
     base_image_key = data["base_image"]
     base_image_spec = benchmark.base_images.get(base_image_key)
@@ -259,6 +276,12 @@ def make_task_spec(task_path: Path, benchmark: BenchmarkMeta) -> TaskSpec:
         lambda: task_spec.judge_image_hash,
     )
 
+    if benchmark._source_sha256 is not None:
+        task_spec._source_revision = TaskSourceRevision(
+            task_sha256=hashlib.sha256(raw).hexdigest(),
+            benchmark_sha256=benchmark._source_sha256,
+            task_spec_sha256=task_spec_sha256(task_spec),
+        )
     return task_spec
 
 

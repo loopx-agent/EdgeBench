@@ -45,6 +45,7 @@ def generate_submit_script() -> str:
     Flags:
       --details, -d    submit and show detailed per-test results
       --list, -l       show submission history and current limits (no new submission)
+      --context       show immutable run evaluation conditions (no new submission)
       --result ID     poll a submission from this run's history (no new submission)
       --no-wait       return after acceptance, or read --result once without polling
       --json          emit the native response and optional source receipt as JSON
@@ -58,6 +59,7 @@ def _generate_submit_script() -> str:
 set -e
 
 LIST_MODE=0
+CONTEXT_MODE=0
 RESULT_MODE=0
 DETAILS_MODE=0
 NO_WAIT=0
@@ -68,6 +70,7 @@ while [ "$#" -gt 0 ]; do
     shift
     case "$arg" in
         --list|-l) LIST_MODE=1 ;;
+        --context) CONTEXT_MODE=1 ;;
         --details|-d) DETAILS_MODE=1 ;;
         --no-wait) NO_WAIT=1 ;;
         --json) JSON_MODE=1 ;;
@@ -89,6 +92,7 @@ while [ "$#" -gt 0 ]; do
             echo "Options:"
             echo "  --list, -l      Show previous scores, remaining submissions and current cooldown"
             echo "                   Read-only; does not submit or reserve a round"
+            echo "  --context      Read service-owned task/evaluator conditions for this registration"
             echo "  --details, -d   Submit and show detailed per-test results (triggers a new submission)"
             echo "  --result ID     Read/poll an existing submission from this run without submitting again"
             echo "                  Combine with --details for full test details"
@@ -117,6 +121,10 @@ fi
 
 if [ "$LIST_MODE" -eq 1 ] && [ -n "$SUBMISSION_ID" ]; then
     echo "ERROR: Choose only one of --list or --result" >&2
+    exit 1
+fi
+if [ "$CONTEXT_MODE" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || [ "$RESULT_MODE" -eq 1 ] || [ "$DETAILS_MODE" -eq 1 ] || [ "$NO_WAIT" -eq 1 ]; }; then
+    echo "ERROR: --context is a read-only operation; combine only with --json" >&2
     exit 1
 fi
 if [ "$NO_WAIT" -eq 1 ] && { [ "$LIST_MODE" -eq 1 ] || { [ "$DETAILS_MODE" -eq 1 ] && [ "$RESULT_MODE" -eq 0 ]; }; }; then
@@ -166,6 +174,12 @@ emit_receipt() {
     fi
     echo "$1" | jq -c . >&3
 }
+
+if [ "$CONTEXT_MODE" -eq 1 ]; then
+    CONTEXT=$(get_json "$FEEDBACK_URL/context")
+    echo "$CONTEXT" | jq -c . >&3
+    exit 0
+fi
 
 if [ "$LIST_MODE" -eq 1 ]; then
     HIST=$(get_json "$FEEDBACK_URL/history")

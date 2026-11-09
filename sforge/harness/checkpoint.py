@@ -30,7 +30,6 @@ import stat
 import tempfile
 import time
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,6 +37,8 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from sforge.harness.selection import select_best
+from sforge.harness.evaluation_conditions import RunEvaluationContext
+from sforge.harness.task_spec import task_spec_sha256
 
 if TYPE_CHECKING:
     from sforge.harness.judge_server import JudgeState
@@ -264,18 +265,13 @@ class JudgeCheckpoints:
             raise CheckpointUnavailable(
                 "Checkpoint v1 supports non-game Docker registrations"
             )
-        import sforge
-
-        source = hashlib.sha256()
-        source_root = Path(sforge.__file__).parent
-        for path in sorted(source_root.rglob("*.py")):
-            source.update(path.relative_to(source_root).as_posix().encode() + b"\0")
-            source.update(hashlib.sha256(path.read_bytes()).digest())
+        if self.state.native_source_sha256 is None:
+            raise CheckpointUnavailable("Native evaluator source is unavailable")
         # Image tags alone do not establish the same evaluator bytes.
         image = self.state.backend.client.images.get(task.judge_image_key)
         return {
-            "native_source_sha256": source.hexdigest(),
-            "task_spec_sha256": _sha(_encode(asdict(task))),
+            "native_source_sha256": self.state.native_source_sha256,
+            "task_spec_sha256": task_spec_sha256(task),
             "judge_image_key": task.judge_image_key,
             "judge_image_id": image.id,
             "backend": "docker",
@@ -362,6 +358,18 @@ class JudgeCheckpoints:
             )
         for entry in history:
             result = results[entry["submission_id"]]
+            context = result.get("evaluation_context")
+            if context is not None:
+                try:
+                    context = RunEvaluationContext.model_validate(context)
+                except ValueError as error:
+                    raise CheckpointUnavailable("Invalid native evaluation context") from error
+                conditions = context.evaluation_conditions
+                if context.task_id != task_id or (conditions is not None and any(
+                    getattr(conditions, key) != packet["evaluator"][key]
+                    for key in ("native_source_sha256", "task_spec_sha256", "judge_image_id", "score_direction", "selection")
+                )):
+                    raise CheckpointUnavailable("Released evaluation conditions differ")
             status = result["status"]
             if (
                 status not in ("completed", "error")
@@ -480,7 +488,7 @@ class JudgeCheckpoints:
                 }
                 # Preserve optional accepted-archive identity across remapped
                 # lookup IDs, without inventing it for older capsules.
-                for key in ("archive_sha256", "archive_bytes"):
+                for key in ("archive_sha256", "archive_bytes", "evaluation_context"):
                     if key in result:
                         results[entry["submission_id"]][key] = result[key]
             observed = time.time()
@@ -737,7 +745,7 @@ class JudgeCheckpoints:
                         raise CheckpointUnavailable(
                             "Native cooldown cannot be anchored on the destination clock"
                         )
-                    state._publish_session(info, prepared[1], token)
+                    state._publish_session(info, prepared[1], token, prepared[3])
                     state._checkpoint_runs.add(run_id)
                 return token
             except BaseException:
@@ -751,6 +759,7 @@ class JudgeCheckpoints:
                             state._run_key(run_id, task_id), None
                         )
                         state.run_backends.pop(state._run_key(run_id, task_id), None)
+                        state._registered_evaluators.pop(info["registration_id"], None)
                         state._checkpoint_runs.discard(run_id)
                     state._checkpoint_tail.rollback(info["registration_id"])
                 shutil.rmtree(destination)
