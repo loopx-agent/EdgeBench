@@ -481,10 +481,14 @@ def test_details_alone_still_submits_and_obeys_existing_cooldown(judge):
     assert judge.state.resolve_token(judge.token) == before
 
 
-def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge):
+@pytest.mark.parametrize("retain", [False, True])
+def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge, tmp_path, retain):
+    retained = tmp_path / "retained archives"
+    retained.mkdir()
+    archive_args = ("--retain-archive", str(retained)) if retain else ()
     judge.grade_release.clear()
     try:
-        submitted = judge.run("--json", "--no-wait")
+        submitted = judge.run("--json", "--no-wait", *archive_args)
         assert submitted.returncode == 0, submitted.stderr
         accepted = json.loads(submitted.stdout)
         sid = accepted_id(judge)
@@ -503,6 +507,15 @@ def test_json_receipt_survives_pending_reads_and_workspace_deletion(judge):
         assert receipt["schema_version"] == "sforge_submission_receipt_v1"
         assert receipt["task_id"] == "example" and receipt["round_id"] == "agent-1"
         assert receipt["archive_bytes"] > 0 and len(receipt["archive_sha256"]) == 64
+        if retain:
+            archive, = retained.glob("*/submission.tar.gz")
+            assert str(archive.resolve()) in submitted.stderr
+            assert archive.parent.stat().st_mode & 0o777 == 0o700
+            assert archive.stat().st_mode & 0o777 == 0o600
+            assert len(archive.read_bytes()) == receipt["archive_bytes"]
+            assert hashlib.sha256(archive.read_bytes()).hexdigest() == receipt["archive_sha256"]
+        else:
+            assert not list(retained.iterdir())
         before = judge.state.resolve_token(judge.token)
         shutil.rmtree(judge.patch)
         pending = judge.run("--json", "--result", sid, "--no-wait")
@@ -615,9 +628,11 @@ def test_json_rejects_mismatched_or_malformed_source_receipt(judge, field, value
 
 
 @pytest.mark.parametrize("path", ["/submit", "result"])
-def test_json_lost_reply_reuses_server_receipt_without_resubmitting(judge, path):
+def test_json_lost_reply_reuses_server_receipt_without_resubmitting(judge, path, tmp_path):
+    retained = tmp_path / "archives"
+    retained.mkdir()
     with drop_one_reply(judge, path) as (url, gateway):
-        lost = judge.run("--json", judge_url=url)
+        lost = judge.run("--json", "--retain-archive", str(retained), judge_url=url)
         assert gateway.dropped and lost.returncode != 0 and not lost.stdout
         history = judge.run("--json", "--list", judge_url=url)
         sid = json.loads(history.stdout)["entries"][0]["submission_id"]
@@ -627,8 +642,31 @@ def test_json_lost_reply_reuses_server_receipt_without_resubmitting(judge, path)
         assert recovered.returncode == 0, recovered.stderr
         result = json.loads(recovered.stdout)
         assert result["submission_id"] == sid
+        archive, = retained.glob("*/submission.tar.gz")
+        assert str(archive.resolve()) in lost.stderr
+        assert result["receipt"]["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
         assert result["receipt"]["archive_sha256"] == judge.graded_archive_digests[0]
         assert judge.state.resolve_token(judge.token) == before
+
+
+def test_retention_destinations_and_read_modes_fail_before_submitting(judge, tmp_path, monkeypatch):
+    retained = tmp_path / "archives"
+    retained.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(judge.patch, target_is_directory=True)
+    before = judge.state.resolve_token(judge.token)
+    for args in (("--list", "--retain-archive", str(retained)),
+                 ("--result", "existing-id", "--retain-archive", str(retained))):
+        rejected = judge.run(*args)
+        assert rejected.returncode != 0 and "requires a new submission" in rejected.stderr
+    rejected = judge.run("--retain-archive", str(alias))
+    assert rejected.returncode != 0 and "outside the work tree" in rejected.stderr
+    monkeypatch.setenv("SFORGE_SUBMIT_PATHS", "..")
+    rejected = judge.run("--retain-archive", str(retained))
+    assert rejected.returncode != 0 and "overlaps a submitted path" in rejected.stderr
+    assert not list(retained.iterdir())
+    assert judge.state.resolve_token(judge.token) == before
+    assert not judge.state.get_run_history("run", "example")["entries"]
 
 
 @pytest.mark.parametrize("read_flags", [(), ("--no-wait",)])

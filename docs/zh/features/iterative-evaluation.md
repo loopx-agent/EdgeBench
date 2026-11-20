@@ -46,6 +46,10 @@ SForge 采用迭代式“评测-改进”循环：Agent 修改代码，提交评
 | `sforge-submit --no-wait` | 提交快照，接受后返回提交 ID |
 | `sforge-submit --result ID --details` | 等待已有提交的反馈，不重复提交 |
 | `sforge-submit --result ID --no-wait --details` | 只查询一次，返回 pending 或终态反馈 |
+| `sforge-submit --retain-archive DIR` | 提交并将实际上传的原包保存到现有 `DIR` 下的私有目录 |
+
+选择工作区和全部提交路径以外的目录。客户端会在上传前通过 stderr 打印归档路径。
+回执丢失后，查询已受理的提交并用 JSON 来源回执核对原包。此选项沿用原提交额度和冷却。
 | `sforge-submit --list` / `-l` | 列出历史提交 |
 
 异步提交后，可以先继续独立工作，再查询同一 ID。pending 响应不包含分数，也不更新
